@@ -3,7 +3,6 @@
 
 # In[8]:
 
-
 import numpy as np
 import torch
 from scipy.spatial.transform import Rotation as Rot
@@ -91,7 +90,8 @@ class IGSO3Sampler:
 class SO3Algebra:
     def __init__(self, device="cpu"):
         self.device = torch.device(device)
-        self.exp_map = torch.linalg.matrix_exp
+        #self.exp_map = torch.linalg.matrix_exp
+        self.sampler = IGSO3Sampler()
 
 
     def log_map_si(self, R_mat):
@@ -133,6 +133,10 @@ class SO3Algebra:
         I = torch.eye(3, dtype=omega.dtype, device=omega.device)
 
         return I + torch.sin(theta) * K + (1.0 - torch.cos(theta)) * (K @ K)
+    
+    def exp_map(self, omega: torch.Tensor) -> torch.Tensor: 
+        return torch.linalg.matrix_exp(self.skew(omega))
+
 
     # ------------------------------------------------------------------
     def geodesic_interpolation_si(self,
@@ -156,56 +160,6 @@ class SO3Algebra:
 
         return term1 @ term2
     
-    #Old versions of skew to vec, vec to skew, log, and exp
-    """
-    def skew(self, v):                                   # v (...,3)
-        vx, vy, vz = v.unbind(-1)           # each has shape (...)
-
-        O = torch.zeros_like(vx)            # same batch shape, scalar entries
-
-        row0 = torch.stack((  O, vz,  -vy), dim=-1)
-        row1 = torch.stack(( -vz,   O, vx), dim=-1)
-        row2 = torch.stack((vy,  -vx,   O), dim=-1)
-
-        return torch.stack((row0, row1, row2), dim=-2)
-
-    def get_v(self, S):                                  # vee
-        return torch.stack([S[..., 2, 1],
-                        S[..., 0, 2],
-                        S[..., 1, 0]], dim=-1)          # (...,3)
-
-    
-    def log_map(self, R):                                # (...,3,3)→(...,3,3)
-        tr   = torch.einsum("...ii->...", R)
-        cos  = ((tr - 1) / 2).clamp(-1.0, 1.0)
-        theta = torch.acos(cos)
-        S    = 0.5 * (R.transpose(-2, -1) - R)
-        coef = theta / torch.sin(theta + 1e-8)
-        coef = torch.where(theta < 1e-4, torch.ones_like(coef), coef)
-        return coef[..., None, None] * S
-
-    def exp_map(self, omegas: torch.Tensor) -> torch.Tensor:
-        """ 
-        """
-        Vectorized SO(3) exponential map.
-        Args
-            omegas : (..., 3)  axis-angle tensor (1-D or N-D)
-        Returns
-            (..., 3, 3) rotation matrices
-        """
-        """
-        # Ensure a batch dimension for iteration when ndim == 1
-        if omegas.ndim == 1:
-            omegas = omegas.unsqueeze(0)   # (1,3)
-
-        # Loop over leading dimension(s) – cheap for small B
-        R_list = [self.exp_map_single(omega) for omega in omegas]  # len == B
-        R = torch.stack(R_list, dim=0)      # (B,3,3)
-
-        # Squeeze back if caller passed a single vector (optional)
-        return R
-    
-    """
         
     #Code from leach et al
     def get_v(self, skew: torch.Tensor) -> torch.Tensor:
@@ -254,11 +208,27 @@ class SO3Algebra:
         return log_r_mat
 
 
-    def sample_ig_so3(self, sigma):
+    def sample_ig_so3_approx(self, sigma):
         v = torch.randn(3, device=self.device) * sigma
         R = torch.as_tensor(Rot.from_rotvec(v.cpu().numpy()).as_matrix(),
                             device=self.device, dtype=torch.float32)
         return v, R
+
+    
+    def sample_ig_so3(self, sigma: torch.Tensor | float, n_samples: int = 1):
+        """
+        Draw n_samples rotations from IGSO(3, σ) and return
+        (rotvecs, R) with shapes (n,3) and (n,3,3)
+        """
+        sigma_val = float(torch.as_tensor(sigma))
+        rotvec_np = self.sampler.sample_vector(sigma_val, n_samples)
+
+        # torch-ify the axis–angle batch
+        rotvec = torch.as_tensor(rotvec_np, dtype=torch.float32, device=self.device)  # (n,3)
+
+        # use your algebra’s batched exponential map
+        R = self.exp_map(rotvec)   # shape (n,3,3)
+        return rotvec.squeeze(0), R.squeeze(0)
 
     #Still need to implement batching for this function and tilde_nu
     def geodesic_interpolation(self, gamma, R):
@@ -334,6 +304,7 @@ class so3_diffuser:
         self.alg = SO3Algebra(device=self.device)       
 
         self.model = SO3DiffusionMLP().to(self.device)
+    
 
     def make_beta_schedule(self, T, beta_start=1e-4, beta_end=0.02):
         return torch.linspace(beta_start, beta_end, T, dtype=torch.float32)
@@ -357,11 +328,11 @@ class so3_diffuser:
                         * betas[1:]
         return beta_hats
 
-    def generate_noise(self, t, scale=1.0):
-        sigma = scale * torch.sqrt(1 - self.alpha_bars[t-1])
+    def generate_noise(self, t, batch_size, scale=1.0):
+        sigma = scale * torch.sqrt(1 - self.alpha_bars[t])
 
         v_list, R_list = zip(*[self.alg.sample_ig_so3(sigma)
-                               for _ in range(self.batch_size)])
+                               for _ in range(batch_size)])
         R_noises = torch.stack(R_list)                      # (B,3,3)
         Sv = torch.stack([self.alg.log_map(R) for R in R_list])  
         v = torch.stack([self.alg.get_v(S) for S in Sv])  
@@ -370,9 +341,9 @@ class so3_diffuser:
 
     def add_noise(self, x, R_noises, t):
         S   = self.alg.log_map(x)                           # (B, 3, 3)
-        v   = self.alg.get_v(S) * torch.sqrt(self.alpha_bars[t-1])
-        #x_scaled = self.alg.exp_map(v)
-        x_scaled = torch.stack([self.alg.exp_map(v_i) for v_i in v]).squeeze(1)     # (B, 3, 3)
+        v   = self.alg.get_v(S) * torch.sqrt(self.alpha_bars[t])
+        x_scaled = self.alg.exp_map(v)
+        #x_scaled = torch.stack([self.alg.exp_map_si(v_i) for v_i in v]).squeeze(1)     # (B, 3, 3)
         return torch.bmm(R_noises, x_scaled)   
 
     def _se_sample(self, x_t, t, noise,
@@ -383,13 +354,13 @@ class so3_diffuser:
         x_t = x_t.squeeze(0)
         
 
-        v = noise * torch.sqrt(1 - self.alpha_bars[t-1])    # (3,)
+        v = noise * torch.sqrt(1 - self.alpha_bars[t])    # (3,)
         v = v.squeeze(0)
         a1 = self.alg.exp_map_si(
                 self.alg.get_v_si(self.alg.log_map_si(x_t))
                 / torch.sqrt(self.alpha_bars[t]))
         
-        a2 = self.alg.exp_map_si(v / torch.sqrt(1 - self.alpha_bars[t]))
+        a2 = self.alg.exp_map_si(v)# / torch.sqrt(1 - self.alpha_bars[t]))
         x_0 = a1 @ a2.transpose(-1, -2)
 
         x_t = self.alg.tilde_nu_si(x_t, x_0, t,
@@ -411,12 +382,11 @@ class so3_diffuser:
         else:
             R_noise = torch.eye(3, device=device).repeat(B,1,1)
 
-        v_scaled = noise * torch.sqrt(1 - self.alpha_bars[t-1])
-
+        v_scaled = noise * torch.sqrt(1 - self.alpha_bars[t])
         S   = self.alg.log_map(x_t)
         omega = self.alg.get_v(S)
         a1  = self.alg.exp_map(omega / torch.sqrt(self.alpha_bars[t]))
-        a2  = self.alg.exp_map(v_scaled / torch.sqrt(1 - self.alpha_bars[t]))
+        a2  = self.alg.exp_map(v_scaled) #/ torch.sqrt(1 - self.alpha_bars[t]))
         x0  = torch.bmm(a1, a2.transpose(1,2))
 
         xtm1 = self.alg.tilde_nu(x_t, x0, t,
@@ -443,6 +413,7 @@ class so3_diffuser:
             x_t_optim.grad.zero_()
         return x_t_optim
         
+
 
 
 # In[ ]:
