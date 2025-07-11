@@ -55,9 +55,9 @@ class r3_diffuser:
                         * betas[1:]
         return beta_hats
             
-    def generate_noise(self, shape, t, scale=1.0):
+    def generate_noise(self, shape, t, batch_size, scale=1.0):
         sigma = torch.sqrt(1 - self.alpha_bars[int(t)]) * scale
-        noise = sigma * torch.randn((self.batch_size, *shape),
+        noise = sigma * torch.randn((batch_size, *shape),
                                     device=self.device, dtype=torch.float32)
         return noise
 
@@ -113,23 +113,42 @@ class r3_diffuser:
             v_noise = torch.zeros_like(x_t)
 
 
+        """
+
         v_tensor = (1 - self.alpha_bars[t])/(torch.sqrt(1 - self.alpha_bars[t])) *  eps_pred
         x_prev = (1 / torch.sqrt(torch.tensor(self.alphas[t]))) * (x_t - v_tensor) + v_noise
+    
+        """
+        t_idx = t - 1
+
+        beta_t  = self.betas[t_idx]
+        alpha_t = self.alphas[t_idx]
+        alpha_bar_t  = self.alpha_bars[t_idx]
+        alpha_bar_tm1 = self.alpha_bars[t_idx-1] if t > 1 else alpha_bar_t
+
+        coef1 = 1.0 / torch.sqrt(alpha_t)                          # 1/√α_t
+        coef2 = (1.0 - alpha_t) / torch.sqrt(1.0 - alpha_bar_t)    # (1-α_t)/√(1-ᾱ_t)
+
+        x_mean = coef1 * (x_t - coef2 * eps_pred)                  # deterministic part
+
+        # variance term (set add_noise=False if you want DDIM-style deterministic sampling)
+        sigma_t = torch.sqrt(beta_t) * torch.sqrt(1 - alpha_bar_tm1) / torch.sqrt(1 - alpha_bar_t)
+        x_prev  = x_mean + sigma_t * torch.randn_like(x_t) if t > 1 else x_mean
 
         if guidance and t % optim_steps == 0:
             with torch.no_grad():                       
                 x_prev = self.descent(x_prev,
                                     (x_t - sqrt_one_m_abar * eps_pred) / torch.sqrt(abar_t),
                                     t, cost)
+        
+        #OPTIONAL PRINT STATEMENTS TO MONITOR DENOISING 
         """
-        OPTIONAL PRINT STATEMENTS TO MONITOR DENOISING 
         if t in [1, 10, 50, 96, 95, 94, 93, 92, 91 , 90, 97, 98, 99, 100, 200, 500, 996, 997, 998, self.T - 1]:
             alpha_t = self.alphas[t].item()
             alpha_bar_t = self.alpha_bars[t].item()
             beta_hat_t = self.beta_hats[t].item()
             coeff = (1 - alpha_t) / max((1 - alpha_bar_t)**0.5, 1e-5)
 
-            
             print(f"\nStep t={t}")
             print("v_noise   = ", v_noise)
             print("x_prev", x_prev)
@@ -138,9 +157,6 @@ class r3_diffuser:
         """
         return x_prev
 
-
-
-# In[ ]:
 
 
 
