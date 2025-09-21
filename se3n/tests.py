@@ -24,7 +24,7 @@ from matplotlib.colors import Normalize
 import matplotlib.cm as cm
 
 """
-This class is designed to test individual pieces of the SO(3)^{n} and R^{3}^{n} diffusers to ensure they work consistently. 
+This class is designed to test individual pieces of the SO3 and R3 diffusers to ensure they work consistently. 
 """
 
 def test_so3_alg(batch_size: int = 8, dtype=torch.float32, device='cpu'):
