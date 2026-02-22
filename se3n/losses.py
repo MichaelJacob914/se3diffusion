@@ -22,90 +22,244 @@ from mpl_toolkits.mplot3d import Axes3D
 from matplotlib import cm
 from matplotlib.colors import Normalize
 import matplotlib.cm as cm
-
-
-# In[9]:
-
+from se3n_utils import rot_trans_from_se3
+from torchlie.functional import SE3
 
 #This class defines various loss functions which are useful to have seperate from the diffuser class
+def _to_torch(x, ref):
+    return x if isinstance(x, torch.Tensor) else torch.as_tensor(x, device=ref.device, dtype=ref.dtype)
 
-def loss_pose(diffuser, R_clean, T_clean, X, T_0, t, step = 0): 
+def diffusion_loss_relative_pose(diffuser, R_clean, T_clean, R_pred, T_pred, t, eps=1e-8, lambda_dir=1.0):
     """
-    Compute rotation loss between predicted and ground-truth rotation matrices.
+    Time-weighted relative-pose loss with chordal (Frobenius) rotation term
+    and full-vector relative translation differences (scene normalized).
 
-    Args:
-        R_clean: [B, N, 3, 3] - ground truth rotation matrices
-        X      : [B, N, 3]    - predicted 3D vectors to be interpreted as rotation
-        t      : unused, but kept for interface consistency
+    Inputs:
+      R_* : camera->world rotations  [B,N,3,3]
+      T_* : camera->world translations [B,N,3] 
+      t   : timesteps [B,N] 
 
-    Returns:
-        Scalar rotation loss (mean geodesic distance in radians)
+
+    Rot loss:   0.5 * E_pairs[ wR * || R_err - I ||_F^2 ],  R_err = R_pred_rel^T R_clean_rel
+    Trans loss: 0.5 * E_pairs[ wT * || R_i^T (T_j - T_i) - R_i^T (T_j - T_i) ||_2^2 ] 
     """
-    B, N = X.shape[:2]
 
+    B, N = T_clean.shape[:2]
+    device = R_clean.device
 
-    # Convert X -> quaternions -> rotation matrices
-    X_flat = X.reshape(B * N, 3)  # [B*N, 3]
-    q = diffuser.so3.alg.make_unit_quaternion(X_flat)         # [B*N, 4]
-    R_pred = diffuser.so3.alg.quaternion_to_rotmat(q)         # [B*N, 3, 3]
-    R_pred = R_pred.reshape(B, N, 3, 3)            # [B, N, 3, 3]
+    # ---- relative rotations ----
+    R_clean_iT = R_clean.transpose(-2, -1)
+    R_pred_iT  = R_pred .transpose(-2, -1)
 
-    # Compute geodesic distance between R_pred and R_clean
-    R_rel = torch.matmul(R_pred.transpose(-2, -1), R_clean)  # [B, N, 3, 3]
-    trace = R_rel[..., 0, 0] + R_rel[..., 1, 1] + R_rel[..., 2, 2]  # [B, N]
+    R_clean_rel = R_clean_iT.unsqueeze(2) @ R_clean.unsqueeze(1)   # [B,N,N,3,3]
+    R_pred_rel  = R_pred_iT .unsqueeze(2) @ R_pred .unsqueeze(1)   # [B,N,N,3,3]
 
-    # Clamp for numerical stability
-    cos_theta = 0.5 * (trace - 1.0)
-    cos_theta = torch.clamp(cos_theta, -1.0 + 1e-6, 1.0 - 1e-6)
+    R_err   = R_pred_rel.transpose(-2, -1) @ R_clean_rel           # [B,N,N,3,3]
+    R_err_I = R_err - torch.eye(3, device=device, dtype=R_err.dtype)
+    rot_pair = (R_err_I ** 2).sum(dim=(-2, -1))                    # [B,N,N]
 
-    loss_rot = .5 * torch.acos(cos_theta).mean()  # Mean over all B and N
-    loss_trans = .5 * ((T_clean - T_0) ** 2).mean()
-    return loss_rot + loss_trans
+    trace   = R_err[..., 0, 0] + R_err[..., 1, 1] + R_err[..., 2, 2]
 
-def loss_relative_pose(diffuser, R_clean, T_clean, X, T_0, R_t, ts):
+    cos_th  = 0.5 * (trace - 1.0)
+    cos_th  = torch.clamp(cos_th, -1.0 + 1e-6, 1.0 - 1e-6)
+    rot_pair_geodesic = torch.acos(cos_th)                          # [B,N,N]
+
+    # ---- relative translations in local frames ----
+    dT_clean = T_clean.unsqueeze(2) - T_clean.unsqueeze(1)          # [B,N,N,3]
+    dT_pred  = T_pred.unsqueeze(2) - T_pred.unsqueeze(1)          # [B,N,N,3]
+
+    t_clean_rel = (R_clean.transpose(-2,-1).unsqueeze(2) @ dT_clean.unsqueeze(-1)).squeeze(-1)  # [B,N,N,3]
+    t_pred_rel  = (R_pred .transpose(-2,-1).unsqueeze(2) @ dT_pred .unsqueeze(-1)).squeeze(-1)  # [B,N,N,3]
+
+    # ---- mask out diagonal pairs ----
+    offdiag = ~torch.eye(N, dtype=torch.bool, device=device).unsqueeze(0).expand(B, -1, -1)
+    rot_flat   = rot_pair .masked_select(offdiag)
+    rot_flat_geodesic = rot_pair_geodesic.masked_select(offdiag)
+
+    # ---- timestep-dependent weights (per-B) ----
+    t_b = t[:, 0].to(dtype=torch.float32)         # [B]
+    t_b = t_b.clamp(0.01, 1.0)
+
+    sR = _to_torch(diffuser.so3.score_scaling(t_b), R_clean)  # [B]
+    sT = _to_torch(diffuser.r3.score_scaling(t_b),  R_clean)  # [B]
+    
+    wR_B = (sR).view(B, 1, 1).expand(B, N, N)
+    wT_B = (sT).view(B, 1, 1).expand(B, N, N)
+
+    wR = wR_B.masked_select(offdiag) + eps
+    wT = wT_B.masked_select(offdiag) + eps
+
+    # flatten pairs per batch element
+    tp = t_pred_rel[offdiag].reshape(B, -1, 3)   # [B, M, 3]
+    tg = t_clean_rel[offdiag].reshape(B, -1, 3)  # [B, M, 3]
+
+    # timestep weights per pair 
+    wT_pairs = wT.reshape(B, -1)                 # [B, M]
+
+    # compute s* (per batch element)
+    num = ((tp * tg)).sum(dim=(1,2))          # [B]
+    den = ((tp * tp)).sum(dim=(1,2)) + eps    # [B]
+    s_star = (num / den)                                                # [B]
+    s_star = s_star.detach()#.clamp(-10.0, 10.0)
+
+    tp_scaled = tp * s_star[:, None, None]
+
+    tg_dir = tg / (tg.norm(dim=-1, keepdim=True) + eps)                # [B,M,3]
+    tp_dir = tp / (tp.norm(dim=-1, keepdim=True) + eps)  # [B,M,3]
+
+    dir_per_pair = 1.0 - (tp_dir * tg_dir).sum(dim=-1)                 # [B,M]
+
+    loss_trans_dir = (wT_pairs * dir_per_pair).sum() / (wT_pairs.sum() + eps)
+    loss_trans_dir = lambda_dir * loss_trans_dir
+
+    delta = 0.1
+    per_pair = torch.nn.functional.smooth_l1_loss(tp_scaled, tg, beta=delta, reduction="none").sum(dim=-1)  # [B,M]
+    loss_trans = 0.5 * (wT_pairs * per_pair).sum() / (wT_pairs.sum() + eps)
+
+    # ---- weighted means ----
+    loss_rot   = 0.5 * (wR * rot_flat).sum()   / (wR.sum() + eps)
+    loss_rot_geodesic = 0.5 * (wR * rot_flat_geodesic).sum() / (wR.sum() + eps)
+
+    return loss_rot, loss_rot_geodesic, loss_trans, loss_trans_dir
+
+def regression_loss_relative_pose(
+    regresser,
+    R_clean, T_clean, R_pred, T_pred,
+    eps=1e-8,
+    lambda_dir=0.0,
+    delta=0.1,
+):
     """
-    Compute relative pose loss between predicted and true pose pairs (active convention).
-
-    Args:
-        R_clean: [B, 2, 3, 3] - GT rotation matrices for views 1 and 2
-        T_clean: [B, 2, 3]    - GT translations
-        X: [B, 2, 3]          - Predicted 3D vectors (to be converted to quats)
-        T_0: [B, 2, 3]        - Predicted translations
-        t: unused
-    Returns:
-        Scalar loss for relative pose: rotation + translation
+    Scale-invariant relative translation loss + relative rotation losses.
+    No diffusion/timestep weighting.
     """
-    B = X.shape[0]
 
-    # Convert predicted 3D -> quaternion -> rotation matrix
-    q = diffuser.so3.alg.make_unit_quaternion(X.reshape(B * 2, 3))             # [B*2, 4]
-    R_pred = diffuser.so3.alg.quaternion_to_rotmat(q).reshape(B, 2, 3, 3)      # [B, 2, 3, 3]
+    B, N = T_clean.shape[:2]
+    device = R_clean.device
 
-    # Ground-truth relative pose (active)
-    R1_gt, R2_gt = R_clean[:, 0], R_clean[:, 1]                    # [B, 3, 3]
-    T1_gt, T2_gt = T_clean[:, 0], T_clean[:, 1]                    # [B, 3]
+    # ---- relative rotations ----
+    R_clean_rel = R_clean.transpose(-2, -1).unsqueeze(2) @ R_clean.unsqueeze(1)  # [B,N,N,3,3]
+    R_pred_rel  = R_pred .transpose(-2, -1).unsqueeze(2) @ R_pred .unsqueeze(1)  # [B,N,N,3,3]
 
-    R_gt_rel = torch.matmul(R2_gt, R1_gt.transpose(-2, -1))        # [B, 3, 3]
-    T_gt_rel = -torch.matmul(R2_gt, torch.matmul(R1_gt.transpose(-2, -1), T1_gt.unsqueeze(-1))).squeeze(-1) + T2_gt  # [B, 3]
+    R_err = R_pred_rel.transpose(-2, -1) @ R_clean_rel  # [B,N,N,3,3]
 
-    # Predicted relative pose (active)
-    R1_pred, R2_pred = R_pred[:, 0], R_pred[:, 1]
-    T1_pred, T2_pred = T_0[:, 0], T_0[:, 1]
+    I = torch.eye(3, device=device, dtype=R_err.dtype)
+    rot_pair_frob = ((R_err - I) ** 2).sum(dim=(-2, -1))  # [B,N,N]
 
-    R_pred_rel = torch.matmul(R2_pred, R1_pred.transpose(-2, -1))
-    T_pred_rel = -torch.matmul(R2_pred, torch.matmul(R1_pred.transpose(-2, -1), T1_pred.unsqueeze(-1))).squeeze(-1) + T2_pred
+    trace = R_err[..., 0, 0] + R_err[..., 1, 1] + R_err[..., 2, 2]
+    cos_th = torch.clamp(0.5 * (trace - 1.0), -1.0 + 1e-6, 1.0 - 1e-6)
+    rot_pair_geo = torch.acos(cos_th)  # [B,N,N]
 
-    # Rotation geodesic loss
-    R_rel_diff = torch.matmul(R_pred_rel.transpose(-2, -1), R_gt_rel)
-    trace = R_rel_diff[..., 0, 0] + R_rel_diff[..., 1, 1] + R_rel_diff[..., 2, 2]
-    cos_theta = 0.5 * (trace - 1.0)
-    cos_theta = torch.clamp(cos_theta, -1.0 + 1e-6, 1.0 - 1e-6)
-    loss_rot = torch.acos(cos_theta).mean()
+    # ---- relative translations in local frames ----
+    dT_clean = T_clean.unsqueeze(2) - T_clean.unsqueeze(1)  # [B,N,N,3]
+    dT_pred  = T_pred .unsqueeze(2) - T_pred .unsqueeze(1)  # [B,N,N,3]
 
-    # Translation loss
-    loss_trans = ((T_pred_rel - T_gt_rel) ** 2).mean()
+    t_clean_rel = (R_clean.transpose(-2, -1).unsqueeze(2) @ dT_clean.unsqueeze(-1)).squeeze(-1)  # [B,N,N,3]
+    t_pred_rel  = (R_pred .transpose(-2, -1).unsqueeze(2) @ dT_pred .unsqueeze(-1)).squeeze(-1)  # [B,N,N,3]
 
-    return loss_rot + loss_trans
+    # ---- mask out diagonal ----
+    offdiag = ~torch.eye(N, dtype=torch.bool, device=device).unsqueeze(0)  # [1,N,N]
+    offdiag = offdiag.expand(B, -1, -1)                                    # [B,N,N]
+
+    # flatten pairs per batch element: M = N*(N-1)
+    tp = t_pred_rel[offdiag].reshape(B, -1, 3)   # [B,M,3]
+    tg = t_clean_rel[offdiag].reshape(B, -1, 3)  # [B,M,3]
+
+    # ---- scale fit s* (uniform weights) ----
+    # s = argmin_s || s*tp - tg ||^2  =>  s = <tp,tg>/<tp,tp>
+    num = (tp * tg).sum(dim=(1, 2))                      # [B]
+    den = (tp * tp).sum(dim=(1, 2)) + eps                # [B]
+    s_star = (num / den).clamp(min=0.0)      # [B]  (detach recommended)
+
+    tp_scaled = tp * s_star[:, None, None]
+
+    # scale-invariant robust loss
+    per_pair = F.smooth_l1_loss(tp_scaled, tg, beta=delta, reduction="none").sum(dim=-1)  # [B,M]
+    loss_trans = 0.5 * per_pair.mean()
+
+    # optional direction loss (scale-free)
+    if lambda_dir > 0.0:
+        tp_dir = tp / (tp.norm(dim=-1, keepdim=True) + eps)
+        tg_dir = tg / (tg.norm(dim=-1, keepdim=True) + eps)
+        # 1 - cosine similarity
+        dir_pair = 1.0 - (tp_dir * tg_dir).sum(dim=-1)   # [B,M]
+        loss_trans_dir = lambda_dir * dir_pair.mean()
+
+    # rotation losses
+    loss_rot = 0.5 * rot_pair_frob[offdiag].mean()
+    loss_rot_geodesic = 0.5 * rot_pair_geo[offdiag].mean()
+
+    return loss_rot, loss_rot_geodesic, loss_trans, loss_trans_dir
+
+
+def loss_relative_pose(
+    G_clean, G_pred, 
+    eps=1e-8,
+    lambda_dir=0.2,
+    delta=0.0,
+):
+    """
+    Scale-invariant relative translation loss + relative rotation losses.
+    No diffusion/timestep weighting.
+    """
+    R_clean, T_clean = rot_trans_from_se3(G_clean)
+    R_pred, T_pred =  rot_trans_from_se3(G_pred)
+    B, N = T_clean.shape[:2]
+    device = R_clean.device
+    # ---- relative rotations ----
+    R_clean_rel = R_clean.transpose(-2, -1).unsqueeze(2) @ R_clean.unsqueeze(1)  # [B,N,N,3,3]
+    R_pred_rel  = R_pred .transpose(-2, -1).unsqueeze(2) @ R_pred .unsqueeze(1)  # [B,N,N,3,3]
+
+    R_err = R_pred_rel.transpose(-2, -1) @ R_clean_rel  # [B,N,N,3,3]
+
+    I = torch.eye(3, device=device, dtype=R_err.dtype)
+    rot_pair_frob = ((R_err - I) ** 2).sum(dim=(-2, -1))  # [B,N,N]
+
+    trace = R_err[..., 0, 0] + R_err[..., 1, 1] + R_err[..., 2, 2]
+    cos_th = torch.clamp(0.5 * (trace - 1.0), -1.0 + 1e-6, 1.0 - 1e-6)
+    rot_pair_geo = torch.acos(cos_th)  # [B,N,N]
+
+    # ---- relative translations in local frames ----
+    dT_clean = T_clean.unsqueeze(2) - T_clean.unsqueeze(1)  # [B,N,N,3]
+    dT_pred  = T_pred .unsqueeze(2) - T_pred .unsqueeze(1)  # [B,N,N,3]
+
+    t_clean_rel = (R_clean.transpose(-2, -1).unsqueeze(2) @ dT_clean.unsqueeze(-1)).squeeze(-1)  # [B,N,N,3]
+    t_pred_rel  = (R_pred .transpose(-2, -1).unsqueeze(2) @ dT_pred .unsqueeze(-1)).squeeze(-1)  # [B,N,N,3]
+
+    # ---- mask out diagonal ----
+    offdiag = ~torch.eye(N, dtype=torch.bool, device=device).unsqueeze(0)  # [1,N,N]
+    offdiag = offdiag.expand(B, -1, -1)                                    # [B,N,N]
+
+    # flatten pairs per batch element: M = N*(N-1)
+    tp = t_pred_rel[offdiag].reshape(B, -1, 3)   # [B,M,3]
+    tg = t_clean_rel[offdiag].reshape(B, -1, 3)  # [B,M,3]
+
+    # ---- scale fit s* (uniform weights) ----
+    # s = argmin_s || s*tp - tg ||^2  =>  s = <tp,tg>/<tp,tp>
+    num = (tp * tg).sum(dim=(1, 2))                      # [B]
+    den = (tp * tp).sum(dim=(1, 2)) + eps                # [B]
+    s_star = (num / den).clamp(min=0.0)      # [B]  (detach recommended)
+    #s_star = s_star.detach()
+
+    tp_scaled = tp * s_star[:, None, None]
+
+    # scale-invariant robust loss
+    per_pair = F.smooth_l1_loss(tp_scaled, tg, beta=delta, reduction="none").sum(dim=-1)  # [B,M]
+    loss_trans = 0.5 * per_pair.mean()
+
+    # optional direction loss (scale-free)
+    if lambda_dir > 0.0:
+        tp_dir = tp / (tp.norm(dim=-1, keepdim=True) + eps)
+        tg_dir = tg / (tg.norm(dim=-1, keepdim=True) + eps)
+        # 1 - cosine similarity
+        dir_pair = 1.0 - (tp_dir * tg_dir).sum(dim=-1)   # [B,M]
+        loss_trans = loss_trans + lambda_dir * dir_pair.mean()
+
+    # rotation losses
+    loss_rot = 0.5 * rot_pair_frob[offdiag].mean()
+    loss_rot_geodesic = 0.5 * rot_pair_geo[offdiag].mean()
+
+    return loss_rot, loss_trans, loss_rot_geodesic
 
 def loss_score_alt(
     diffuser,
@@ -209,7 +363,7 @@ def loss_score(
     if hasattr(diffuser, "T") and diffuser.T:
         Ttot = int(diffuser.T)
     else:
-        Ttot = 1000  # sensible default for your euclidean compute_score
+        Ttot = 1000  
 
     # If user passed a discrete step (>=1), map to [0,1] for tau; otherwise assume it's already [0,1]
     tau = t_scalar_raw / float(Ttot) if t_scalar_raw >= 1.0 else t_scalar_raw
@@ -261,7 +415,6 @@ def loss_score(
     loss_score_rot = (((sR_true - sR_pred) ** 2) / (scale_R ** 2)).sum(dim=-1).mean()
 
     # ---- translation score loss (Euclidean) ----
-    # Uses your batch-capable compute_score(x_t, t=[B,N], x0)
     with torch.no_grad():
         sT_true = diffuser.r3.compute_score(T_t, t_b, T_clean)   # [B,N,3]
     sT_pred = diffuser.r3.compute_score(T_t, t_b, T_pred)        # [B,N,3]
@@ -287,11 +440,6 @@ def loss_score(
     total = loss_trans + w_score * loss_score_total
 
     return total
-
-# %%
-
-
-# In[ ]:
 
 
 

@@ -7,35 +7,62 @@ from functools import lru_cache
 import numpy as np
 import torch
 import torch.nn.functional as F
+from torch.cuda.amp import autocast
 
-def se3_from_rot_trans(R: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+def se3_from_rot_trans(R, t):
+    # R [..., 3, 3], t [..., 3]
+    T = torch.zeros((*R.shape[:-2], 4, 4), device=R.device, dtype=R.dtype)
+    T[..., :3, :3] = R
+    T[..., :3, 3] = t
+    T[..., 3, 3] = 1
+    return T  # [..., 4, 4]
+    
+def build_intrinsics(fl: torch.Tensor, pp: torch.Tensor) -> torch.Tensor:
     """
-    R: [N, 3, 3] rotation matrices
-    t: [N, 3]    translations
-    returns: [N, 4, 4] homogeneous SE(3) poses
-    """
-    assert R.ndim == 3 and R.shape[-2:] == (3, 3), "R must be [N,3,3]"
-    assert t.ndim == 2 and t.shape[-1] == 3 and t.shape[0] == R.shape[0], "t must be [N,3]"
-    N = R.shape[0]
-    device, dtype = R.device, R.dtype
-    T = torch.zeros((N, 4, 4), device=device, dtype=dtype)
-    T[:, :3, :3] = R
-    T[:, :3,  3] = t
-    T[:,  3,  3] = 1
-    return T
+    Make camera intrinsics K from focal lengths and principal points.
 
-def rot_trans_from_se3(T: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    Args:
+        fl: (..., 2) tensor with [fx, fy]
+        pp: (..., 2) tensor with [cx, cy]
+
+    Returns:
+        Ks: (..., 3, 3) intrinsics matrices
+             [[fx, 0,  cx],
+              [0,  fy, cy],
+              [0,  0,  1 ]]
     """
-    T: [N, 4, 4] homogeneous SE(3)
+    assert fl.shape[:-1] == pp.shape[:-1] and fl.shape[-1] == 2 and pp.shape[-1] == 2
+    *batch, _ = fl.shape
+    Ks = torch.zeros(*batch, 3, 3, device=fl.device, dtype=fl.dtype)
+    Ks[..., 0, 0] = fl[..., 0]
+    Ks[..., 1, 1] = fl[..., 1]
+    Ks[..., 0, 2] = pp[..., 0]
+    Ks[..., 1, 2] = pp[..., 1]
+    Ks[..., 2, 2] = 1.0
+    return Ks
+
+def rot_trans_from_se3(T: torch.Tensor):
+    """
+    T: [..., 4, 4] homogeneous SE(3)
     returns:
-      R: [N, 3, 3]
-      t: [N, 3]
+      R: [..., 3, 3]
+      t: [..., 3]
     """
-    assert T.ndim == 3 and T.shape[-2:] == (4, 4), "T must be [N,4,4]"
-    R = T[:, :3, :3]
-    t = T[:, :3,  3]
+    assert T.shape[-2:] == (4, 4), "T must be [...,4,4]"
+    R = T[..., :3, :3]
+    t = T[..., :3, 3]
     return R, t
 
+def se3_expand(G34: torch.Tensor) -> torch.Tensor:
+    # (...,3,4) -> (...,4,4)
+    *batch, _, _ = G34.shape
+    bottom = torch.zeros(*batch, 1, 4, device=G34.device, dtype=G34.dtype)
+    bottom[..., 0, 3] = 1.0
+    return torch.cat([G34, bottom], dim=-2)
+
+def se3_compress(G44: torch.Tensor) -> torch.Tensor:
+    # (...,4,4) -> (...,3,4)
+    return G44[..., :3, :4]
 
 def make_unit_quaternion(x: torch.Tensor) -> torch.Tensor:
     """
@@ -50,7 +77,7 @@ def make_unit_quaternion(x: torch.Tensor) -> torch.Tensor:
     assert x.ndim == 2 and x.shape[1] == 3, "Input must be of shape [B, 3]"
     
     ones = torch.ones((x.shape[0], 1), device=x.device, dtype=x.dtype)
-    quat = torch.cat([x, ones], dim=1)  # [B, 4]
+    quat = torch.cat([ones, x], dim=1)  # [B, 4]
     quat = quat / quat.norm(dim=1, keepdim=True)  # Normalize to unit quaternion
     return quat
 
@@ -101,6 +128,25 @@ def rot6d_to_rotmat(rots6d: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
 
     return torch.stack((r1, r2, r3), dim=-1)            # [...,3,3] (columns)
 
+def rot9d_to_rotmat(r9: torch.Tensor) -> torch.Tensor:
+    """
+    r9: [*, 9] representing a 3x3 matrix 
+    Returns: [*, 3, 3] closest rotation (Frobenius) with det=+1.
+    """
+    orig_dtype = r9.dtype
+    M = r9.reshape(-1, 3, 3).to(torch.float32)
+
+    
+    with torch.amp.autocast("cuda", enabled=False):
+        U, S, Vh = torch.linalg.svd(M, full_matrices=False)   # [B,3,3] each
+        detUVt = torch.det(U @ Vh)                            # [B]
+        s = torch.where(detUVt < 0, -torch.ones_like(detUVt), torch.ones_like(detUVt))
+        D = torch.diag_embed(torch.stack([torch.ones_like(s), torch.ones_like(s), s], dim=-1))  # [B,3,3]
+        R = U @ D @ Vh                                        # [B,3,3]
+    
+
+    return R.view(*r9.shape[:-1], 3, 3).to(orig_dtype)
+
 def exp_map(omega: torch.Tensor) -> torch.Tensor: 
     return torch.linalg.matrix_exp(skew(omega))
 
@@ -141,7 +187,13 @@ def vec_to_pose(vec: torch.Tensor, rep: str) -> torch.Tensor:
         assert vec.ndim == 2 and vec.shape[-1] == 9, "rot6d expects [N,9]"
         rot6d = vec[:, :6]
         t = vec[:, 6:]
-        R = rot6d_to_rotmat(rot6d)          
+        R = rot6d_to_rotmat(rot6d)    
+
+    elif rep == "rot9d":
+        assert vec.ndim == 2 and vec.shape[-1] == 12, "rot9d expects [N,12]"
+        rot9d = vec[:, :9]
+        t = vec[:, 9:]
+        R = rot9d_to_rotmat(rot9d)
 
     else:
         raise ValueError(f"Unknown rep '{rep}'. Use 'axis_angle', 'quat3', or 'rot6d'.")
@@ -654,6 +706,8 @@ class Rotation:
                 The rotation as a quaternion tensor.
         """
         quats = self._quats
+        R = self._rot_mats
+        
         if(quats is None):
             if(self._rot_mats is None):
                 raise ValueError("Both rotations are None")

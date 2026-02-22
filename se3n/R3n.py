@@ -17,31 +17,21 @@ import geoopt
 from geoopt.optim import (RiemannianAdam)
 
 """This class is designed to handle diffusion on R3^{n}"""
-
+"""It has been stripped of the noise prediction and VP preserving paths mentioned below"""
+"""VE and VP correspond to the forward process on SO(3), not on R3. A VE process on SO(3) corresponds to logarithm schedule on R3"""
 class r3_diffuser: 
-    def __init__(self, prediction, T, batch_size=64, betas=None, device="cuda", cfg = None, verbose = False):
+    def __init__(self, prediction, T, batch_size=64, device="cpu", forward_process = "ve", cfg = None, recenter = True, verbose = False, schedule = "cosine"):
         self.device = torch.device(device)
         self.prediction = prediction
         self.T = T
         self.verbose = verbose
-        prediction = "score" 
-        if(prediction == "score"): 
+        self.recenter = recenter
+        self.schedule = schedule
+        self.forward_process = forward_process
+        if(self.forward_process == "ve"): 
             self._r3_conf = cfg
             self.min_b = cfg["min_b"]
             self.max_b = cfg["max_b"]
-            self.betas, self.alphas, self.alpha_bars = self.make_schedules_from_marginal(self.T)
-            self.beta_hats = self.compute_beta_hat(self.betas, self.alpha_bars)
-        elif(prediction == "noise" or prediction == "pose"):
-            if betas is None:
-                self.betas = self.make_cosine_beta_schedule(T).to(self.device)
-            else:
-                self.betas = torch.as_tensor(betas, dtype=torch.float32,
-                                            device=self.device)
-
-            self.alphas, self.alpha_bars = self.compute_alpha_bars(self.betas)
-            self.beta_hats = self.compute_beta_hat(self.betas, self.alpha_bars)
-            self.betas, self.alphas, self.alpha_bars = self.make_schedules_from_marginal(self.T)
-            self.beta_hats = self.compute_beta_hat(self.betas, self.alpha_bars)
 
         self.batch_size = batch_size
         
@@ -61,36 +51,12 @@ class r3_diffuser:
         alpha_bars = torch.cumprod(alphas, dim=0)  # [T]
 
         return betas, alphas, alpha_bars
-   
-    def make_beta_schedule(self, T, beta_start=1e-4, beta_end=0.02):
-        return torch.linspace(beta_start, beta_end, T, dtype=torch.float32)
-
-    def make_cosine_beta_schedule(self, T, s=0.008):
-        steps = torch.arange(T + 1, dtype=torch.float32)
-        alphas_cumprod = torch.cos(((steps / T) + s) / (1 + s)
-                                   * math.pi * 0.5) ** 2
-        alphas_cumprod /= alphas_cumprod[0].clone()
-        betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
-        return betas.clamp(1e-8, 0.999)
-
-    def compute_alpha_bars(self, betas):
-        alphas = 1.0 - betas
-        alpha_bars = torch.cumprod(alphas, dim=0)
-        return alphas, alpha_bars
-
-    def compute_beta_hat(self, betas, alpha_bars):
-        beta_hats = torch.zeros_like(betas)
-        beta_hats[1:] = ((1 - alpha_bars[:-1]) / (1 - alpha_bars[1:])) \
-                        * betas[1:]
-        return beta_hats
 
     def generate_noise(self, t, B, N, scale = 1.0): 
-        if(self.prediction == "score"): 
-            return self.score_generate(t)
-        else: 
-            return self.noise_generate(t, B, N)
+        if(self.forward_process == "ve"): 
+            return self.ve_generate(t)
 
-    def score_generate(self, ts: torch.LongTensor, scale: float = 1.0):
+    def ve_generate(self, ts: torch.LongTensor, scale: float = 1.0):
         """
         Generate Gaussian noise of shape [B, N, 3] with std based on timestep.
 
@@ -106,8 +72,7 @@ class r3_diffuser:
 
         # Compute m and sigma per entry
         ts_flat = ts.reshape(-1).to(torch.float32)
-        Ttot = int(self.T)
-        tau = ts_flat / float(Ttot)
+        tau = ts_flat.clamp(0.01, 1.0)
         m = self.marginal_b_t(tau).to(device=device, dtype=dtype)  # [B*N]
         sigma = scale * torch.sqrt(torch.clamp(1.0 - torch.exp(-m), min=0.0))  # [B*N]
 
@@ -116,175 +81,41 @@ class r3_diffuser:
 
         return eps.view(B, N, 3)
                 
-    def noise_generate(self, ts=None, B=None, N=None, scale=1.0):
-        """
-        Generate Gaussian noise of shape [B, N, 3] with std based on timestep.
-
-        Args:
-            t (int): Scalar diffusion timestep
-            ts (Tensor): Tensor of timesteps with shape [B, N]
-            B (int): Batch size
-            N (int): Number of elements per sample
-            scale (float): Optional multiplier for noise scale
-
-        Returns:
-            Tensor of shape [B, N, 3]
-        """
-        ts_flat = ts.reshape(-1).long()  # (B*N,)
-        sigma_flat = scale * torch.sqrt(1 - self.alpha_bars[ts_flat])  # (B*N,)
-        noise_flat = torch.randn((B * N, 3), device=self.device, dtype=torch.float32)  # (B*N, 3)
-        noise_scaled = sigma_flat[:, None] * noise_flat  # (B*N, 3)
-        return noise_scaled.view(B, N, 3)
-        
 
     def add_noise(self, x, noise, t): 
-        if(self.prediction == "score"): 
-            return self.score_forward(x, noise, t)
+        if(self.forward_process == "ve"): 
+            return self.ve_forward(x, noise, t)
         else: 
-            return self.noise_forward(x, noise, t)
+            return self.vp_forward(x, noise, t)
     
-    def score_forward(self, x0: torch.Tensor, noise: torch.Tensor, ts: torch.Tensor):
+    def ve_forward(self, x0: torch.Tensor, noise: torch.Tensor, ts: torch.Tensor):
         """
         x0:   [B, N, 3]
         ts:   [B, N]      (timesteps)
         noise:[B, N, 3]   (already ~ N(0, sigma_t^2 I_3) with sigma_t = sqrt(1-exp(-m)))
         """
-        Ttot = int(self.T)
-        tau = (ts.to(x0.device, torch.float32) / float(Ttot))          # [B, N]
+        tau = ts.to(x0.device, torch.float32).clamp(0.01, 1.0)
         m = self.marginal_b_t(tau).to(device=x0.device, dtype=x0.dtype)  # [B, N]
         a = torch.exp(-0.5 * m)[..., None]                        # [B, N, 1]
-        return a * x0 + noise     
+        x_t = a * x0 + noise     
+
+        if(self.recenter): 
+            return self.center(x_t)
+        else: 
+            return x_t
         
-    def noise_forward(self, x, noise, t):
-        """
-        Combine Gaussian noise with clean translations.
-
-        Args:
-            x     : [B, N, 3] — clean translation vectors
-            noise : [B, N, 3] — noise vectors (already scaled appropriately)
-            t     : scalar or [B, N] — diffusion timestep(s)
-
-        Returns:
-            x_noisy: [B, N, 3] — noisy translation vectors
-        """
-        if isinstance(t, (int, float)):
-            scale = torch.sqrt(self.alpha_bars[int(t)])
-            x_scaled = scale * x
-        else:
-            t_flat = t.reshape(-1).long()                           # [B*N]
-            scale = torch.sqrt(self.alpha_bars[t_flat])          # [B*N]
-            scale = scale.view(*x.shape[:2], 1)                  # [B, N, 1]
-            x_scaled = x * scale                                 # [B, N, 3]
-
-        return x_scaled + noise
-        
-    def descent(self, x_t, x_0, t, cost, num_updates = 1, lr = 1e-3): 
-        x_0_optim = x_0.clone().detach().requires_grad_(True)
-        x_t_optim = x_t.clone().detach().requires_grad_(True)
-
-        for _ in range(num_updates):
-            loss = cost(x_t_optim, x_0_optim, t)
-            grad = torch.autograd.grad(loss, x_t_optim, create_graph=True)[0]
-            x_t_optim = x_t_optim - lr * grad 
-
-        return x_t_optim
-    
-    def _eu_sample_noise(
-        self, x_t, t, eps_pred,
-        guidance=False, optim_steps=1, cost=None
-    ):
-        """This function is used to sample a single vector in R^{3}^{N}. 
-        Therefore, both x_t and eps_pred are assumed to be of size [N,3]
-        It is important to note that this function assumes noise is passed in and estimates x_0 and x_t-1
-        """
-        if t > 1:
-            v_noise = torch.sqrt(self.beta_hats[t]) * torch.randn_like(x_t)
-        else:
-            v_noise = torch.zeros_like(x_t)
-
-        t_idx = t - 1
-        beta_t = self.betas[t_idx]
-        alpha_t = self.alphas[t_idx]
-        alpha_bar_t = self.alpha_bars[t_idx]
-        alpha_bar_tm1 = self.alpha_bars[t_idx - 1] if t > 1 else alpha_bar_t
-
-        coef1 = 1.0 / torch.sqrt(alpha_t)
-        coef2 = (1.0 - alpha_t) / torch.sqrt(1.0 - alpha_bar_t)
-
-        x_mean = coef1 * (x_t - coef2 * eps_pred)
-
-        sigma_t = torch.sqrt(beta_t) * torch.sqrt(1 - alpha_bar_tm1) / torch.sqrt(1 - alpha_bar_t)
-        x_prev = x_mean + sigma_t * torch.randn_like(x_t) if t > 1 else x_mean
-
-        if guidance and t % optim_steps == 0:
-            with torch.no_grad():
-                x_0_pred = (x_t - torch.sqrt(1 - alpha_bar_t) * eps_pred) / torch.sqrt(alpha_bar_t)
-                x_prev = self.descent(x_prev, x_0_pred, t, cost)
-
-        if self.verbose and t in [1, 10, 50, 90, 100, self.T - 1]:
-            print(f"\nStep t={t}")
-            print("v_noise   = ", v_noise)
-            print("x_prev", x_prev)
-            print(f"  ε̂ norm        = {eps_pred.norm(dim=1).mean().item():.4f}")
-            print(f"  x_t norm       = {x_t.norm(dim=1).mean().item():.4f}")
-
-        return x_prev, x_mean
-    
-    def _eu_sample_pose(
-        self, x_t, t, x_0,
-        guidance=False, optim_steps=1, cost=None
-    ):
-        """
-        Sample x_{t-1} from x_t by first computing x_0.
-        Args:
-            x_t: [N, 3]
-            t: int timestep
-            eps_pred: [N, 3] - predicted noise
-        Returns:
-            x_{t-1}, x_0
-        """
-        # Compute x_0 from x_t and predicted noise
-        alpha_bar_t = self.alpha_bars[t]
-        sqrt_alpha_bar_t = torch.sqrt(alpha_bar_t)
-        sqrt_one_minus_alpha_bar_t = torch.sqrt(1 - alpha_bar_t)
-
-        # Optional guidance via gradient descent on x_0
-        if guidance and t % optim_steps == 0:
-            x_0 = self.descent(x_t, x_0, t, cost)
-
-        # Compute x_{t-1}
-        if t > 1:
-            alpha_bar_tm1 = self.alpha_bars[t - 1]
-            z = torch.randn_like(x_t)
-        else:
-            alpha_bar_tm1 = alpha_bar_t
-            z = torch.zeros_like(x_t)
-
-        x_prev = torch.sqrt(alpha_bar_tm1) * x_0 + torch.sqrt(1 - alpha_bar_tm1) * z
-
-        if self.verbose and t in [1, 2,3,4,5,6,10, 50, 90, 100, self.T - 1]:
-            print(f"\nStep t={t}")
-            print("x_0 =", x_0)
-            print("x_prev =", x_prev)
-            print(f"  x_t norm       = {x_t.norm(dim=1).mean().item():.4f}")
-
-        return x_prev, x_0
-        
-        
-    def _eu_sample_score(
+    def _eu_sample_ve(
         self,
         x_t: torch.Tensor,                  # [N, 3]
-        t: int,                             # discrete step, 0..T
+        t: torch.Tensor,                             # discrete step, 0..T
         x_0: torch.Tensor,                  # [N, 3] predicted clean sample
         solver: "SDE",
+        threshold = 0, 
         guidance: bool = False,
         optim_steps: int = 1,
         cost=None,
-        center: bool = False,
         noise_scale: float = 0.0,
         mask: torch.Tensor | None = None,   # optional boolean/binary mask over [N]
-        eta: float = 0.0,                   # DDIM stochasticity (0 = deterministic)
-        noise: torch.Tensor | None = None,  # DDIM external noise if eta>0
     ):
         """
         One reverse step in R^3 using:
@@ -293,84 +124,31 @@ class r3_diffuser:
         - 'DDIM' -> DDIM-style step using x0_hat (deterministic if eta=0)
 
         Returns:
-            x_prev: [N, 3]
-            x_0:    [N, 3] (possibly guidance-updated)
+            x_prev: [B,N, 3]
+            x_0:    [B,N, 3]
         """
-        assert isinstance(t, int) and 0 <= t <= self.T, "t must be an integer in [0, T]"
         if t == 0:
             return x_0, x_0
 
         device, dtype = x_t.device, x_t.dtype
-        dt = 1.0 / float(self.T)
-        t_cont = float(t) / float(self.T)
+        B, N = x_t.shape[:2]
 
-        # Optional guidance on x_0 (e.g., DPS/reguidance)
-        if guidance and (t % optim_steps == 0):
-            x_0 = self.descent(x_t, x_0, t, cost)
+        t_cont = torch.as_tensor(t, device=device, dtype=torch.float32).clamp(0.01, 1.0)
+        dt = 1.0 / float(self.T)   # keep small Euler step size
 
-        if solver in ("SDE", "ODE"):
+        if self.prediction == "score":
             # ---- Only compute score when needed ----
             # compute_score expects [B, N, 3] and [B, N] for t
-            x_t_b = x_t.unsqueeze(0)                                  # [1, N, 3]
-            x0_b  = x_0.unsqueeze(0)                                  # [1, N, 3]
-            t_b   = torch.full((1, x_t.shape[0]), t, device=device, dtype=torch.long)  # [1, N]
-            score_t = self.compute_score(x_t_b, t_b, x0_b).squeeze(0) # [N, 3]
+            x_t_s = self._scale(x_t)
+            x_0_s = self._scale(x_0)
+            t_b = t_cont.expand(B, N)
+            score_t = self.compute_score(x_t_s, t_b, x_0_s)
 
-            # undo coordinate scaling inside score (matches your earlier code)
-            s = torch.as_tensor(self._r3_conf["coordinate_scaling"], device=device, dtype=dtype)
-            score_t = score_t / s
-
-            # Optional mask broadcasting to [..., 1]
-            np_mask = None
-            if mask is not None:
-                np_mask = mask.detach().bool().cpu().numpy()
-
-            # Convert inputs to numpy for the SDE/ODE steppers
-            x_t_np     = x_t.detach().cpu().numpy()
-            score_np   = score_t.detach().cpu().numpy()
-
-            if solver == "SDE":
-                x_prev_np = self.reverse(
-                    x_t=x_t_np,
-                    score_t=score_np,
-                    t=t_cont,
-                    dt=dt,
-                    mask=np_mask,
-                    center=center,
-                    noise_scale=noise_scale,
-                )
-            else:  # "ODE"
-                x_prev_np = self.reverse_ode(
-                    x_t=x_t_np,
-                    score_t=score_np,
-                    t=t_cont,
-                    dt=dt,
-                    mask=np_mask,
-                    center=center,
-                    noise_scale=None,
-                )
-
-            x_prev = torch.as_tensor(x_prev_np, device=device, dtype=dtype)
-            return x_prev, x_0
-
-        elif solver == "DDIM":
-            # DDIM uses x0_hat directly; score not required here
-            x_prev = self.reverse_ddim(
-                x_t=x_t,                # keep on-device
-                x0_hat=x_0,
-                t=t_cont,
-                dt=dt,
-                mask=mask,
-                eta=eta,
-                noise=noise,
-                center=center,
-                noise_scale=noise_scale,
+            x_prev = self.reverse_sde_torch(
+                x_t=x_t, score_t=score_t, t_cont=t_cont, dt=dt,
+                mask=mask, center=self.recenter, noise_scale=noise_scale
             )
             return x_prev, x_0
-
-        else:
-            raise ValueError(f"Unknown process '{process}'. Use 'SDE', 'ODE', or 'DDIM'.")
-            
     
     def _scale(self, x):
         return x * self._r3_conf["coordinate_scaling"]
@@ -396,6 +174,15 @@ class r3_diffuser:
 
     def marginal_b_t(self, t):
         return t*self.min_b + (1/2)*(t**2)*(self.max_b-self.min_b)
+
+    def b_t_torch(self, t: torch.Tensor) -> torch.Tensor:
+        return self.min_b + t * (self.max_b - self.min_b)
+
+    def diffusion_coef_torch(self, t: torch.Tensor) -> torch.Tensor:
+        return torch.sqrt(self.b_t_torch(t))
+
+    def drift_coef_torch(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        return -0.5 * self.b_t_torch(t)[..., None, None] * x
 
     def calc_trans_0(self, score_t, x_t, t, use_torch=True):
         beta_t = self.marginal_b_t(t)
@@ -456,9 +243,18 @@ class r3_diffuser:
         return x_t, score_t
 
     def score_scaling(self, t: float):
-        return 1 / np.sqrt(self.conditional_var(t))
+        return 1 / torch.sqrt(self.conditional_var(t))
 
-    def reverse(
+    def center(self, x_t):
+        """
+        Recenters translations so that the mean over points is 0.
+        Expects x_t shape: (batch, N, 3) or (batch, ..., N, 3).
+        """
+        # mean over the points dimension (here assumed dim=-2)
+        com = x_t.mean(dim=-2, keepdim=True)  # shape (batch, 1, 3)
+        return x_t - com
+
+    def reverse_sde(
             self,
             *,
             x_t: np.ndarray,
@@ -466,7 +262,7 @@ class r3_diffuser:
             t: float,
             dt: float,
             mask: np.ndarray=None,
-            center: bool=False,
+            center: bool=True,
             noise_scale: float=0.0,
         ):
         """Simulates the reverse SDE for 1 step
@@ -500,61 +296,54 @@ class r3_diffuser:
         x_t_1 = self._unscale(x_t_1)
         return x_t_1
 
-    def reverse_ode(self, x_t, score_t, t, dt, mask=None, center = False, noise_scale = None):
-        x_t = self._scale(x_t)
-        g   = self.diffusion_coef(t)
-        f   = self.drift_coef(x_t, t)
-        # prob-flow ODE: f - 0.5 g^2 score
-        perturb = (f - 0.5 * (g**2) * score_t) * dt
-        if mask is not None: perturb *= mask[..., None]
-        x_t_1 = x_t - perturb
-        return self._unscale(x_t_1)
+    def reverse_sde_torch(
+        self,
+        x_t: torch.Tensor,        # [B,N,3] UNscaled
+        score_t: torch.Tensor,    # [B,N,3] score wrt SCALED variable 
+        t_cont: float,
+        dt: float,
+        mask: torch.Tensor | None = None,   # [B,N] or [N]
+        center: bool = True,
+        noise_scale: float = 0.0,
+    ):
+        device, dtype = x_t.device, x_t.dtype
 
-    def reverse_ddim(self,
-                 x_t: torch.Tensor,     # [..., 3]
-                 x0_hat: torch.Tensor,  # [..., 3] model’s predicted x0 (same shape)
-                 t: float,              # current continuous time in [0,1]
-                 dt: float,             # positive step size
-                 mask: torch.Tensor | None = None,  # optional boolean/binary mask on the "..." dims
-                 eta: float = 0.0,      # 0.0 = deterministic DDIM
-                 noise: torch.Tensor | None = None,  # optional external noise if eta>0
-                 center = False, 
-                 noise_scale = None, 
-                 score_t = None
-                 ) -> torch.Tensor:
-        """
-        Continuous-time DDIM (VP) update: go from time t to s=t-dt using only b(t).
-        Uses m(s) = integral_0^s b(u) du = marginal_b_t(s).
-        """
-        if not (isinstance(t, float) or isinstance(t, int)):
-            raise ValueError("t must be a scalar float in [0,1].")
-        s = max(0.0, float(t) - float(dt))
+        # scale x
+        x = self._scale(x_t)  # [B,N,3]
 
-        # Compute sqrt(alpha_bar_s) and its complement via m(s)
-        # alpha_bar(s) = exp(-m(s))
-        # sqrt_alpha_bar_s = exp(-0.5 * m(s))
-        # std_s = sqrt(1 - alpha_bar(s))
-        m_s = self.marginal_b_t(torch.tensor([s], dtype=torch.float32, device=x_t.device))
-        sqrt_alpha_bar_s = torch.exp(-0.5 * m_s)[0]                  # scalar tensor
-        std_s = torch.sqrt(torch.clamp(1.0 - torch.exp(-m_s)[0], 0.0, 1.0))  # scalar tensor
+        # t tensor as [B,1] for broadcast
+        B, N = x.shape[0], x.shape[1]
+        t = torch.full((B, 1), t_cont, device=device, dtype=torch.float32)
 
-        # Deterministic DDIM (eta=0) → z = 0
-        if eta == 0.0:
-            x_s = sqrt_alpha_bar_s * x0_hat
+        g = self.diffusion_coef_torch(t)  # [B,1]
+        b = self.b_t_torch(t)             # [B,1]
+        f = -0.5 * b[..., None] * x       # [B,N,3]
+
+        if noise_scale > 0.0:
+            z = torch.randn_like(score_t) * noise_scale
         else:
-            # Stochastic DDIM (rarely needed here, but included for completeness)
-            if noise is None:
-                noise = torch.randn_like(x_t)
-            x_s = sqrt_alpha_bar_s * x0_hat + (eta * std_s) * noise
+            z = torch.zeros_like(score_t)
 
-        # Optional masking: update only masked entries
+        perturb = (f - (g[..., None] ** 2) * score_t) * dt + g[..., None] * math.sqrt(dt) * z
+
         if mask is not None:
-            # mask shape should broadcast over the leading "..." dims
-            x_s = torch.where(mask[..., None].bool(), x_s, x_t)
+            if mask.dim() == 1:
+                mask = mask[None, :].expand(B, -1)  # [B,N]
+            perturb = perturb * mask[..., None]
 
-        return x_s
+        x_1 = x - perturb  # [B,N,3]
 
-    def conditional_var(self, t, use_torch=False):
+        if center:
+            if mask is not None:
+                wsum = mask.sum(dim=-1, keepdim=True).clamp(min=1.0)     # [B,1]
+                com = (x_1 * mask[..., None]).sum(dim=-2) / wsum         # [B,3]
+                x_1 = x_1 - com[:, None, :]
+            else:
+                x_1 = self.center(x_1)
+
+        return self._unscale(x_1)
+
+    def conditional_var(self, t, use_torch=True):
         """Conditional variance of p(xt|x0).
 
         Var[x_t|x_0] = conditional_var(t)*I
@@ -583,8 +372,6 @@ class r3_diffuser:
     def compute_score(self, x_t: torch.Tensor, t: torch.Tensor, x0: torch.Tensor, eps: float = 1e-12):
         """
         Compute the true score ∇_{x_t} log p(x_t | x_0) using the continuous VP/SDE.
-        Assumes t has shape [B, N] (constant along N) and we map τ = t/1000.
-
         Args:
             x_t: [B, N, 3]
             t:   [B, N] integer timesteps (expanded along N)
@@ -596,8 +383,8 @@ class r3_diffuser:
         """
         device, dtype = x_t.device, x_t.dtype
 
-        # τ = t / 1000, keep one column since t is constant along N
-        tau = (t.to(device=device, dtype=torch.float32) / self.T)[..., :1]   # [B, 1]
+        # τ = t / 100, keep one column since t is constant along N
+        tau = t.to(device=device, dtype=torch.float32)[..., :1]
 
         # m(τ) = ∫ b(s) ds; a = exp(-m/2); 1 - a^2 = 1 - exp(-m)
         m = self.marginal_b_t(tau)                         # [B, 1] (torch ops)
@@ -612,7 +399,6 @@ class r3_diffuser:
 
         # Score: (a * x0 - x_t) / (1 - a^2)
         return (a * x0 - x_t) / one_minus_a2
-
 
 
 

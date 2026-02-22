@@ -2,16 +2,25 @@
 # coding: utf-8
 import sys
 from pathlib import Path
+import os
+cwd = os.getcwd()
+print("Working directory", cwd)
 HERE = Path(__file__).resolve().parent
 paths = [HERE / "gta", HERE / "gta" / "source"]
 sys.path[:0] = [str(p) for p in paths if p.exists() and str(p) not in sys.path]
+from prope.torch import PropeDotProductAttention 
 import layers
 from layers import Transformer as GTATransformer
 from source.utils.gta import make_SO2mats, make_T2mats
+from torch.backends.cuda import sdp_kernel
+from torch.nn.attention import sdpa_kernel, SDPBackend
+
+from layers import Attention, FeedForward
 from source.utils.common import positionalencoding2d, downsample, rigid_transform
 from source.utils.wigner_d import rotmat_to_wigner_d_matrices
 from SO3n import so3_diffuser, SO3Algebra
 from R3n import r3_diffuser
+from se3n_utils import vec_to_pose, se3_from_rot_trans, Rigid, Rotation, rot9d_to_rotmat
 import torch
 import torch.nn as nn
 from typing import Optional
@@ -30,445 +39,20 @@ Stiefel = geoopt.Stiefel()
 from matplotlib import cm
 from matplotlib.colors import Normalize
 import matplotlib.cm as cm
-
-
-# In[9]:
+from rotary_embedding_torch import RotaryEmbedding
+from ray_rope.pos_enc.rayrope import RayRoPE_DotProductAttention
+from ray_rope.pos_enc.utils.rayrope_mha import MultiheadAttention
 
 
 #TAKEN FROM PAPER
 #NOT MY CODE
 
-
-class SRTConvBlock(nn.Module):
-    def __init__(self, idim, hdim=None, odim=None, downsample=True):
-        super().__init__()
-        if hdim is None:
-            hdim = idim
-
-        if odim is None:
-            odim = 2 * hdim
-
-        conv_kwargs = {'bias': False, 'kernel_size': 3, 'padding': 1}
-        self.layers = nn.Sequential(
-            nn.Conv2d(idim, hdim, stride=1, **conv_kwargs),
-            nn.ReLU(),
-            nn.Conv2d(hdim, odim, stride=2 if downsample else 1, **conv_kwargs),
-            nn.ReLU())
-
-    def forward(self, x):
-        return self.layers(x)
-
-
-class GTASE3(nn.Module):
-    def __init__(self, 
-                 N: int,
-                 d_model: int = 768,
-                 num_att_blocks: int = 5,
-                 num_conv_blocks: int = 5,
-                 num_timesteps: int = 100,
-                 heads: int = 12,
-                 dim_out: int = 6,
-                 device: str = "cuda",
-                 dropout: float = 0.01,
-                 attn_args: Optional[dict] = None,
-                 attn_kwargs: Optional[dict] = None, 
-                 num_images: int = None, 
-                 batch_size: int = 64, 
-                 num_gpus = 2):
-        super().__init__()
-        torch.inverse(torch.ones((1, 1), device="cuda:0"))
-
-        self.N = N
-        self.d_model = d_model
-        self.h, self.w = 2, 2
-        self.device = device
-        self.coord = self.make_2dcoord(self.h, self.w)  # [H, W, 2] numpy array
-        self.downsample = 0
-        self.downsample_input_coord = 0
-        self.num_images = num_images
-        self.batch_size = batch_size
-        self.num_gpus = num_gpus
-
-        #Image Processing
-        self.lin_camera = nn.Linear(12, d_model)  # For camera
-        self.lin_planar = nn.Linear(180, d_model) # For 2d positions
-        self.emb_dim = 0
-        conv_blocks = []
-        cur_hdim = d_model // 8
-
-        # First block: input from image (3 channels)
-        conv_blocks.append(SRTConvBlock(idim=3, hdim=cur_hdim, odim=cur_hdim * 2))
-        cur_hdim *= 2
-
-        # Remaining blocks: keep track of increasing channels
-        for i in range(1, num_conv_blocks):
-            next_hdim = cur_hdim * 2
-            conv_blocks.append(SRTConvBlock(idim=cur_hdim, hdim=cur_hdim, odim=next_hdim))
-            cur_hdim = next_hdim
-
-        self.conv_blocks = nn.Sequential(*conv_blocks)
-
-        self.feature_proj = nn.Conv2d(1024, d_model, kernel_size=1)
-        
-
-        #Pose Processing
-        self.pose_proj = nn.Sequential(
-            nn.Linear(12, d_model * 2),
-            nn.ReLU(),
-            nn.Linear(d_model * 2, d_model)
-        )
-        self.pose_output_proj = nn.Linear(d_model, dim_out)
-
-        #Time processing 
-        self.time_embed = nn.Embedding(num_timesteps, d_model)
-
-        # This should project to attdim after conv_blocks
-        self.per_patch_linear = nn.Conv2d(cur_hdim, d_model, kernel_size=1)
-        self.cls_token = nn.Parameter(torch.randn(1, 1, d_model))  # [1, 1, attdim]
-
-        self.transformer = GTATransformer(
-            dim=d_model,
-            depth=num_att_blocks,
-            heads=heads,
-            dim_head=d_model//heads,
-            mlp_dim=d_model*2,
-            selfatt=True,
-            dropout=dropout,
-            attn_args=attn_args
-        )
-        self.attn_kwargs = attn_kwargs
-
-        self.extras = {}
-        if(self.num_images is not None): 
-            input_coord = self.generate_positional_coords(self.num_images)
-            self.input_coord = input_coord.expand(int(self.batch_size/self.num_gpus), num_images, -1, -1)
-            self.extras['input_coord'] = self.input_coord
-            self.extras['target_coord'] = self.input_coord
-            self.extras = self.pre_compute_reps(self.extras)
-    
-    def generate_feature_tokens(self, feats):
-        """
-        Args:
-            feats: [B, N, 1024, 14, 14]
-        Returns:
-            tokens: [B, N * 4, d_model]
-        """
-        B, N, C, H, W = feats.shape
-        feats = feats.view(B * N, C, H, W)                          # [B*N, 1024, 14, 14]
-        pooled = F.adaptive_avg_pool2d(feats, output_size=(2, 2))  # [B*N, 1024, 3, 3]
-        projected = self.feature_proj(pooled)                      # [B*N, d_model, 3, 3]
-        tokens = projected.flatten(2).transpose(1, 2)              # [B*N, 9, d_model]
-        return tokens.reshape(B, N * 4, -1)                           
-
-    def generate_image_tokens(self, images, pose, batch_size, num_images, downsample_tokens = True):
-        """
-        Generate tokens per image with optional 2D positional and camera pose embeddings.
-
-        Args:
-            images: [B, N, 3, H, W]      - RGB images
-            pose: [B, N, 4, 4] or [B, N, 12] - Camera poses (flattened or full)
-            batch_size: int              - Batch size B
-            num_images: int              - Number of views per sample (N)
-
-        Returns:
-            tokens: [B, N*T, attdim]     - Flattened image tokens per view
-        """
-        images = images.flatten(0, 1)  # [B*N, 3, H, W]
-
-        # Apply CNN feature extractor and project to attention dimension
-        images = self.conv_blocks(images)             # [B*N, C_out, H', W']
-        images = self.per_patch_linear(images)        # [B*N, attdim, H', W']
-        if downsample_tokens:
-            images = F.adaptive_avg_pool2d(images, output_size=(2, 2))  # [B*N, attdim, 2, 2]
-        H_attn, W_attn = images.shape[-2:]
-
-        # 2D positional embedding
-        emb_2dpos = positionalencoding2d(180, H_attn, W_attn).to(images.device)  # [180, H', W']
-        emb_2dpos = emb_2dpos.permute(1, 2, 0)                # [H', W', 180]
-        emb_2dpos = self.lin_planar(emb_2dpos)                # [H', W', attdim]
-        emb_2dpos = emb_2dpos.permute(2, 0, 1)                # [attdim, H', W']
-        emb_2dpos = emb_2dpos[None].repeat(batch_size * num_images, 1, 1, 1)  # [B*N, attdim, H', W']
-
-        # Camera embedding
-        pose = pose.reshape(-1, 4, 4)                          # [B*N, 4, 4]
-        emb_camera = self.lin_camera(pose[:, :3, :].reshape(-1, 12))  # [B*N, attdim]
-        emb_camera = emb_camera[:, :, None, None].expand(-1, -1, H_attn, W_attn)  # [B*N, attdim, H', W']
-
-        # Combine embeddings with image features
-        images = images + emb_2dpos + emb_camera              # [B*N, attdim, H', W']
-
-        # Flatten spatial dimensions into tokens
-        images = images.flatten(2, 3).permute(0, 2, 1)            # [B*N, H'*W', attdim]
-        T, C = images.shape[1:]                                   # T = #patches per image
-
-        # Reshape to [B, N*T, attdim]
-        image_tokens = images.reshape(batch_size, num_images * T, C)
-        return image_tokens
-
-    def generate_time_tokens(self, t, batch_size):
-        """
-        Embed scalar timestep t into a single time token per sample.
-
-        Args:
-            t: [B] or scalar               - diffusion timestep(s)
-            batch_size: int               - B
-
-        Returns:
-            time_tokens: [B, 1, attdim]
-        """
-        if isinstance(t, (int, float)):
-            t = torch.tensor([t] * batch_size, device=self.device).float()
-        elif t.ndim == 1:
-            t = t.float().to(self.device)
-        else:
-            t = t.squeeze(-1).float().to(self.device)  # in case [B,1]
-
-        t = t.view(-1).long()
-        t_embed = self.time_embed(t)          # [B, attdim]
-        time_tokens = t_embed[:, None, :]     # [B, 1, attdim]
-        return time_tokens
-    
-    def generate_pose_tokens(self, pose, batch_size, num_images):
-        """
-        Embed each camera pose into a token.
-
-        Args:
-            pose: [B, N, 4, 4] or [B, N, 12] - pose per view
-            batch_size: int                 - B
-            num_images: int                 - N
-
-        Returns:
-            pose_tokens: [B, N, attdim]
-        """
-        if pose.shape[-2:] == (4, 4):
-            pose = pose[:, :, :3, :].reshape(batch_size, num_images, 12)  # [B, N, 12]
-
-        pose_tokens = self.pose_proj(pose)  # [B, N, attdim]
-        return pose_tokens
-
-    def compute_se3_transforms(self, R, T):
-        """
-        Construct full SE(3) transformation matrices from rotation and translation.
-
-        Inputs:
-            R: [B, N, 3, 3] - rotation matrices
-            T: [B, N, 3]    - translation vectors
-
-        Returns:
-            input_transforms: [B, N, 4, 4] - SE(3) transform
-            target_transforms: [B, N, 4, 4] - identical for now (can be used for symmetry)
-            pose: [B, N, 12] - flattened [R | T] 3x4 matrix for each camera
-        """
-        B, N = R.shape[:2]
-
-        # Create identity row: [0, 0, 0, 1]
-        bottom_row = torch.tensor([0, 0, 0, 1], dtype=R.dtype, device=R.device).view(1, 1, 1, 4)
-        bottom_row = bottom_row.expand(B, N, 1, 4)  # [B, N, 1, 4]
-
-        # Construct [R | T]
-        RT = torch.cat([R, T.unsqueeze(-1)], dim=-1)  # [B, N, 3, 4]
-
-        # Full SE(3): concatenate bottom row
-        se3 = torch.cat([RT, bottom_row], dim=-2)     # [B, N, 4, 4]
-
-        return se3, RT.reshape(B, N, 12)
-
-    def downsample(self, x, num_steps=1):
-        if num_steps is None or num_steps < 1:
-            return x
-        stride = 2**num_steps
-        return x[stride//2::stride, stride//2::stride]
-
-        
-    def make_2dcoord(self, H, W):
-        """
-        Return 2d coord values of shape [H, W, 2] 
-        """
-        x = np.arange(H, dtype=np.float32)/H   # [-0.5, 0.5)
-        y = np.arange(W, dtype=np.float32)/W   # [-0.5, 0.5)
-        x_grid, y_grid = np.meshgrid(x, y, indexing='ij')
-        return np.stack([x_grid.flatten(), y_grid.flatten()], -1).reshape(H, W, 2)
-
-
-    def generate_positional_coords(self, num_images):
-        """
-        Generate [N, H'*W', 2] 2D coordinates for positional embedding.
-
-        Args:
-            num_images: int - number of views N
-
-        Returns:
-            input_coord: [N, H'*W', 2] numpy array
-        """
-        total_downsample = self.downsample + self.downsample_input_coord if self.downsample is not None else self.downsample_input_coord
-        coord_ds = downsample(self.coord, total_downsample)  # [H', W', 2]
-        input_coord = coord_ds.reshape(-1, 2)  # [H'*W', 2]
-        input_coord = torch.tensor(input_coord, dtype=torch.float32, device=self.device)
-        input_coord = input_coord.unsqueeze(0).repeat(num_images, 1, 1)
-        return input_coord
-
-    def forward(self, R, T, feats, imgs, t):
-        """
-        Inputs:
-            R: [B, N, 3, 3]         - rotation matrices
-            T: [B, N, 3]            - translation vectors
-            feats: [B, N, 1024, 14, 14] - CNN feature maps
-            imgs: [B, N, 3, 224, 224]   - RGB images
-            t: scalar or [B]        - diffusion timestep
-        Returns:
-            x: [B, N*T, attdim] or [B, N*T, dim_out]
-            extras: dict containing additional outputs
-        
-        print("R", R.shape)
-        print("T", T.shape)
-        print("feats", feats.shape)
-        print("imgs", imgs.shape)
-        """
-        batch_size, num_images = R.shape[:2]
-        device = R.device
-        # --- Compute SE(3) Transforms ---
-        input_transforms, pose = self.compute_se3_transforms(R, T)
-        target_transforms = input_transforms
-
-        # --- Positional Coordinates ---
-        if(self.num_images is None): 
-            # --- Extras Dictionary ---
-            extras = {
-                'input_transforms': input_transforms,
-                'target_transforms': target_transforms,
-            }
-        else: 
-            extras = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in self.extras.items()}
-            extras['input_transforms'] = input_transforms
-            extras['target_transforms'] = input_transforms
-
-        # --- Precompute Representations for Geometric Attention ---
-        extras = self.compute_reps(extras)
-
-        # --- Time Tokens: expand to per-view ---
-        time_tokens = self.generate_time_tokens(t, batch_size)  # [B, 1, d]
-        time_tokens = time_tokens.expand(-1, num_images, -1)    # [B, N, d]
-
-        # --- Pose Tokens ---
-        pose_tokens = self.generate_pose_tokens(pose, batch_size, num_images)  # [B, N, d]
-
-        # --- Image Tokens ---
-        image_tokens = self.generate_image_tokens(imgs, input_transforms, batch_size, num_images)  # [B, N*T_i, d]
-        image_tokens = image_tokens.reshape(batch_size, num_images, -1, image_tokens.shape[-1])       # [B, N, T_i, d]
-
-        # --- Feature Tokens ---
-        feature_tokens = self.generate_feature_tokens(feats)  # [B, N*T_f, d]
-        feature_tokens = feature_tokens.reshape(batch_size, num_images, -1, feature_tokens.shape[-1]) # [B, N, T_f, d]
-
-        # --- Stack per-view tokens: [pose, image*4, feature*4, time] => [B, N, 10, d]
-        tokens = torch.cat([
-            pose_tokens.unsqueeze(2),           # [B, N, 1, d]
-            image_tokens,                       # [B, N, T_i=4, d]
-            feature_tokens,                     # [B, N, T_f=4, d]
-            time_tokens.unsqueeze(2),           # [B, N, 1, d]
-        ], dim=2)  # [B, N, 10, d]
-
-        # Flatten to [B, N*10, d]
-        tokens = tokens.view(batch_size, num_images * 10, -1)  # [B, N*10, d]
-
-        # --- Transformer ---
-        x = self.transformer(tokens, None, extras)  # [B, N*10, d]
-        
-        pose_outputs = x[:, ::10, :]  # [B, N, d]
-        pose_preds = self.pose_output_proj(pose_outputs)
-        return pose_preds
-
-    def pre_compute_reps(self, extras):
-        """
-        Precomputes so2 and t2 reps if possible
-        """
-        reps = extras
-        f_dims = self.attn_kwargs['f_dims']
-        flattened_reps = []
-        flattened_invreps = []
-        if 'so2' in f_dims and f_dims['so2'] > 0:
-            coord = extras['input_coord']
-            coord = coord.reshape(coord.shape[0], -1, 2)  # [B, Nq*Tq, 2]
-            so2rep = make_SO2mats(coord,
-                                    nfreqs=self.attn_kwargs['so2'],
-                                    max_freqs=[self.attn_kwargs['max_freq_h'],
-                                                self.attn_kwargs['max_freq_w']],
-                                    shared_freqs=self.attn_kwargs['shared_freqs'] if 'shared_freqs' in self.attn_kwargs else False)  # [B, Nq*Tq, deg, 2, 2, 2]
-            so2rep = so2rep.flatten(-4, -3)
-            NqTq = so2rep.shape[1]
-            reps['so2rep_q'] = reps['so2rep_k'] = so2rep  # [B, T, C, 2, 2]
-            reps['so2fn'] = lambda A, x: torch.einsum(
-                'btcij,bhtcj->bhtci', A, x)
-            flattened = so2rep.reshape(
-                so2rep.shape[0], so2rep.shape[1], -1)  # [B, T, C*2*2]
-            flattened_reps.append(flattened)
-            # [B, T, C*2*2]
-            flattened_inv = so2rep.transpose(-2, -1).reshape(
-                so2rep.shape[0], so2rep.shape[1], -1)
-            flattened_invreps.append(flattened_inv)
-
-        if 't2' in f_dims and f_dims['t2'] > 0:
-            coord = extras['input_coord']
-            coord = coord.reshape(coord.shape[0], -1, 2)  # [B, Nq*Tq, 2]
-            t2rep = make_T2mats(coord)  # [B, Nq*Tq, 2] -> [B, Nq*Tq, 3, 3]
-            reps['t2rep_q'] = reps['t2rep_k'] = t2rep
-            reps['inv_t2rep_q'] = torch.linalg.inv(t2rep.clone())
-            reps['t2fn'] = lambda A, x: torch.einsum(
-                'btij,bhtcj->bhtci', A, x)
-
-        reps['flattened_rep_q'] = reps['flattened_rep_k'] = torch.cat(flattened_reps, -1)  # 16 + 2*freqs*2*2
-        reps['flattened_invrep_q'] = torch.cat(flattened_invreps, -1)
-        return reps
-
-    def compute_reps(self, extras):
-        reps = extras
-        f_dims = self.attn_kwargs['f_dims']
-        flattened_reps = []
-        flattened_invreps = []
-        NqTq = 20
-
-        if 'se3' in f_dims and f_dims['se3'] > 0:
-            extrinsic = extras['input_transforms']
-            se3rep = torch.linalg.inv(extrinsic.clone())  # [B, Nq, 4, 4]
-            reps['se3fn'] = lambda A, x: torch.einsum(
-                'bnij,bhntcj->bhntci', A, x)
-            reps['se3rep_q'] = reps['se3rep_k'] = se3rep
-            reps['inv_se3rep_q'] = extrinsic
-
-            flattened = extrinsic.repeat_interleave(
-                NqTq//extrinsic.shape[1], 1).transpose(-2, -1).reshape(se3rep.shape[0], -1, 16)  # [B, T, 4*4]
-            flattened_reps.append(flattened)
-            flattened_inv = extrinsic.repeat_interleave(
-                NqTq//extrinsic.shape[1], 1).reshape(se3rep.shape[0], -1, 16)  # [B, T, 4*4]
-            flattened_invreps.append(flattened_inv)
-
-        if 'so3' in f_dims and f_dims['so3'] > 0:
-            n_degs = self.attn_kwargs['so3']
-            R_q = torch.linalg.inv(extras['input_transforms'].clone())[..., :3, :3]
-            B, Nq = R_q.shape[0], R_q.shape[1]
-            D_q = rotmat_to_wigner_d_matrices(n_degs, R_q.flatten(0, 1))[1:]
-            for i, D in enumerate(D_q):
-                if 'zeroout_so3' in self.attn_kwargs and self.attn_kwargs['zeroout_so3']:
-                    D_q[i] = torch.zeros_like(
-                        D.reshape(B, Nq, D.shape[-2], D.shape[-1]))
-                elif 'id_so3' in self.attn_kwargs and self.attn_kwargs['id_so3']:
-                    D_q[i] = torch.stack([torch.eye(
-                        D.shape[-1])]*B*Nq, 0).reshape(B, Nq, D.shape[-2], D.shape[-1]).to(D.device)
-                else:
-                    D_q[i] = D.reshape(B, Nq, D.shape[-2], D.shape[-1])
-            reps['so3rep_q'] = reps['so3rep_k'] = D_q
-            reps['so3fn'] = lambda A, x: torch.einsum(
-                'bnij,bhnkj->bhnki', A, x)
-
-        reps['flattened_rep_q'] = reps['flattened_rep_k'] = torch.cat(flattened_reps, -1)  # 16 + 2*freqs*2*2
-        reps['flattened_invrep_q'] = torch.cat(flattened_invreps, -1)
-        return reps
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# ---------------------- helpers: 2D sinusoidal pos enc ----------------------
+
+
 def _build_2d_sincos_pos_embed(h: int, w: int, d: int, device=None):
     """
     Returns [h*w, d] 2D sinusoidal embeddings.
@@ -482,17 +66,105 @@ def _build_2d_sincos_pos_embed(h: int, w: int, d: int, device=None):
     ys = torch.arange(h, device=device, dtype=torch.float32)
     xs = torch.arange(w, device=device, dtype=torch.float32)
     yy, xx = torch.meshgrid(ys, xs, indexing="ij")  # [h,w]
-    xx = xx.reshape(-1, 1)  # [h*w,1]
-    yy = yy.reshape(-1, 1)  # [h*w,1]
-    # pos enc per axis → [h*w, 2m]
+    xx = xx.reshape(-1, 1) 
+    yy = yy.reshape(-1, 1) 
+
     pos_x = torch.cat([torch.sin(xx * inv_freq), torch.cos(xx * inv_freq)], dim=-1)
     pos_y = torch.cat([torch.sin(yy * inv_freq), torch.cos(yy * inv_freq)], dim=-1)
-    # concat → [h*w, d]
     pe = torch.cat([pos_x, pos_y], dim=-1)
     return pe  # [h*w, d]
 
 
-# ---------------------- SwiGLU MLP (ratio=4) ----------------------
+def pre_compute_reps(attn_kwargs, extras):
+    coord = extras.get('input_coord', None)
+    NqTq = None
+    if coord is not None:
+        coord = coord.reshape(coord.shape[0], -1, coord.shape[-1])  # [B, Nq*Tq, 2]
+        NqTq = coord.shape[1]
+    f_dims = attn_kwargs['f_dims']
+    flattened_reps = []
+    flattened_invreps = []
+    if 'so2' in f_dims and f_dims['so2'] > 0:
+        coord = extras['input_coord']
+        coord = coord.reshape(coord.shape[0], -1, 2)  # [B, Nq*Tq, 2]
+        so2rep = make_SO2mats(coord,
+                                nfreqs=attn_kwargs['so2'],
+                                max_freqs=[attn_kwargs['max_freq_h'],
+                                            attn_kwargs['max_freq_w']],
+                                shared_freqs=attn_kwargs['shared_freqs'] if 'shared_freqs' in attn_kwargs else False)  # [B, Nq*Tq, deg, 2, 2, 2]
+        so2rep = so2rep.flatten(-4, -3)
+        NqTq = so2rep.shape[1]
+        extras['so2rep_q'] = extras['so2rep_k'] = so2rep  # [B, T, C, 2, 2]
+        extras['so2fn'] = lambda A, x: torch.einsum(
+            'btcij,bhtcj->bhtci', A, x)
+        flattened = so2rep.reshape(
+            so2rep.shape[0], so2rep.shape[1], -1)  # [B, T, C*2*2]
+        flattened_reps.append(flattened)
+        # [B, T, C*2*2]
+        flattened_inv = so2rep.transpose(-2, -1).reshape(
+            so2rep.shape[0], so2rep.shape[1], -1)
+        flattened_invreps.append(flattened_inv)
+    if 't2' in f_dims and f_dims['t2'] > 0:
+        coord = extras['input_coord']
+        coord = coord.reshape(coord.shape[0], -1, 2)  # [B, Nq*Tq, 2]
+        t2rep = make_T2mats(coord)  # [B, Nq*Tq, 2] -> [B, Nq*Tq, 3, 3]
+        extras['t2rep_q'] = extras['t2rep_k'] = t2rep
+        extras['inv_t2rep_q'] = torch.linalg.inv(t2rep)
+        extras['t2fn'] = lambda A, x: torch.einsum(
+            'btij,bhtcj->bhtci', A, x)
+
+    if 'se3' in f_dims and f_dims['se3'] > 0:
+        extrinsic = extras['input_transforms']
+        se3rep = torch.linalg.inv(extrinsic)  # [B, Nq, 4, 4]
+        if 'ray_to_se3' in attn_kwargs and attn_kwargs['ray_to_se3']:
+            B, Nq = se3rep.shape[0], se3rep.shape[1]
+            input_rays = downsample(
+                extras['input_rays'], 3).reshape(B, Nq, -1, 3)
+            # [B, Nq, T, 4, 4]
+            R = ray2rotation(input_rays, return_4x4=True)
+            se3rep = torch.einsum(
+                'bnij,bntjk->bntik', se3rep, R)  # mul from right
+            extrinsic = torch.einsum(
+                'bntij,bnjk->bntik',  R.transpose(-2, -1), extrinsic)  # mul from left
+            extras['se3fn'] = lambda A, x: torch.einsum(
+                'bntij,bhntcj->bhntci', A, x)
+        else:
+            extras['se3fn'] = lambda A, x: torch.einsum(
+                'bnij,bhntcj->bhntci', A, x)
+        extras['se3rep_q'] = extras['se3rep_k'] = se3rep
+        extras['inv_se3rep_q'] = extrinsic
+
+        flattened = extrinsic.repeat_interleave(
+            NqTq//extrinsic.shape[1], 1).transpose(-2, -1).reshape(se3rep.shape[0], -1, 16)  # [B, T, 4*4]
+        flattened_reps.append(flattened)
+        flattened_inv = extrinsic.repeat_interleave(
+            NqTq//extrinsic.shape[1], 1).reshape(se3rep.shape[0], -1, 16)  # [B, T, 4*4]
+        flattened_invreps.append(flattened_inv)
+
+    if 'so3' in f_dims and f_dims['so3'] > 0:
+        n_degs = attn_kwargs['so3']
+        R_q = torch.linalg.inv(extras['input_transforms'])[..., :3, :3]
+        B, Nq = R_q.shape[0], R_q.shape[1]
+        D_q = rotmat_to_wigner_d_matrices(n_degs, R_q.flatten(0, 1))[1:]
+        for i, D in enumerate(D_q):
+            if 'zeroout_so3' in attn_kwargs and attn_kwargs['zeroout_so3']:
+                D_q[i] = torch.zeros_like(
+                    D.reshape(B, Nq, D.shape[-2], D.shape[-1]))
+            elif 'id_so3' in attn_kwargs and attn_kwargs['id_so3']:
+                D_q[i] = torch.stack([torch.eye(
+                    D.shape[-1])]*B*Nq, 0).reshape(B, Nq, D.shape[-2], D.shape[-1]).to(D.device)
+            else:
+                D_q[i] = D.reshape(B, Nq, D.shape[-2], D.shape[-1])
+        extras['so3rep_q'] = extras['so3rep_k'] = D_q
+        extras['so3fn'] = lambda A, x: torch.einsum(
+            'bnij,bhnkj->bhnki', A, x)
+
+    extras['flattened_rep_q'] = extras['flattened_rep_k'] = torch.cat(
+        flattened_reps, -1)  # 16 + 2*freqs*2*2
+    extras['flattened_invrep_q'] = torch.cat(flattened_invreps, -1)
+
+
+
 class SwiGLU(nn.Module):
     def __init__(self, d_model: int, mlp_ratio: float = 4.0, dropout: float = 0.0):
         super().__init__()
@@ -508,7 +180,6 @@ class SwiGLU(nn.Module):
         return self.drop(x)
 
 
-# ---------------------- Transformer block (pre-norm) ----------------------
 class TransformerBlock(nn.Module):
     def __init__(self, d_model, nhead, mlp_ratio=4.0, dropout=0.0):
         super().__init__()
@@ -525,142 +196,1233 @@ class TransformerBlock(nn.Module):
         x = x + self.dropout1(y)
         x = x + self.mlp(self.norm2(x))
         return x
-# ---------------------- Transformer (grid size configurable; default 3x3) ----------------------
-class Transformer(nn.Module):
-    def __init__(self,
-                 N: int,
-                 d_model: int = 768,
-                 num_att_blocks: int = 6,          # (intra ↔ inter) alternations → 12 total blocks
-                 num_heads: int = 12,
-                 dim_out: int = 6,
-                 num_timesteps: int = 100,
-                 grid_hw: int = 5,                 # <<< 3x3 grid → 9 tokens/view
-                 dropout: float = 0.0):
+        
+class ResBlock(nn.Module):
+    def __init__(self, c):
         super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(c, c, 3, padding=1), nn.GELU(),
+            nn.Conv2d(c, c, 3, padding=1)
+        )
+        self.se = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(c, c//4, 1), nn.GELU(),
+            nn.Conv2d(c//4, c, 1), nn.Sigmoid()
+        )
+    def forward(self, x):
+        y = self.net(x)
+        y = y * self.se(x)
+        return x + y
 
+    
+class StandardTransformer(nn.Module):
+    """
+    Alternating intra/inter attention
+    """
+    def __init__(self,
+                 d_model: int = 384,
+                 num_layers: int = 8,
+                 representation: str = "quat",
+                 prediction: str = "pose",     # "pose" | "noise"
+                 num_heads: int = 8,
+                 dropout: float = 0.00,
+                 num_timesteps: int = 100,
+                 grid_hw_img: int = 0, 
+                 grid_hw_feat: int = 6):
+        super().__init__()
         assert d_model % 4 == 0, "d_model must be divisible by 4 for 2D sincos PE."
-        self.N = N
+
         self.d_model = d_model
-        self.grid_hw = grid_hw
-        self.n_img_tokens  = grid_hw * grid_hw     # 9 tokens/view
-        self.n_feat_tokens = grid_hw * grid_hw     # 9 tokens/view
+        self.num_layers = num_layers
+        self.representation = representation
+        self.prediction = prediction
+        self.grid_hw_img = grid_hw_img
+        self.grid_hw_feat = grid_hw_feat
+        self.n_img_tokens  = grid_hw_img * grid_hw_img
+        self.n_feat_tokens = grid_hw_feat * grid_hw_feat
 
         # ----------- Projections / Encoders -----------
-        self.pose_proj  = nn.Linear(12, d_model)
-        self.time_embed = nn.Embedding(num_timesteps, d_model)
-
-        # Stronger image tokenizer → grid_hw x grid_hw tokens/view
-        self.img_backbone = nn.Sequential(
-            nn.Conv2d(3, 128, kernel_size=7, stride=2, padding=3), nn.GELU(),
-            nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1), nn.GELU(),
-            nn.AdaptiveAvgPool2d((self.grid_hw, self.grid_hw)),
-            nn.Conv2d(256, d_model, kernel_size=1), nn.GELU()
+        self.pose_proj  = nn.Sequential(nn.Linear(12, d_model), 
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, d_model), nn.SiLU(), nn.Dropout(dropout),
+            nn.Linear(d_model, d_model)
         )
 
-        # Feature tokenizer → grid_hw x grid_hw tokens/view
-        self.feat_proj = nn.Conv2d(1024, d_model, kernel_size=1)
+        self.time_embed = nn.Sequential(
+            nn.Linear(1, d_model), nn.SiLU(), nn.Linear(d_model, d_model)
+        )
 
-        # ----------- 2D positional encodings for img/feat grids -----------
-        pos_img  = _build_2d_sincos_pos_embed(self.grid_hw, self.grid_hw, d_model)
-        pos_feat = _build_2d_sincos_pos_embed(self.grid_hw, self.grid_hw, d_model)
-        self.register_buffer("pos_img",  pos_img,  persistent=False)  # [grid^2, d]
-        self.register_buffer("pos_feat", pos_feat, persistent=False)  # [grid^2, d]
+        self.img_backbone = nn.Sequential(
+            nn.Conv2d(3, 128, 7, stride=2, padding=3), nn.GELU(),
+            nn.Conv2d(128, 256, 3, stride=2, padding=1), nn.GELU(),
+            ResBlock(256), ResBlock(256),
+            nn.AdaptiveAvgPool2d((grid_hw_img, grid_hw_img)),
+            nn.Conv2d(256, d_model, 1), nn.GELU(),
+            ResBlock(d_model)
+        )
 
-        # ----------- Token-type embeddings (shared across views) -----------
-        # 0=view_summary, 1=pose, 2=time, 3=feat, 4=img
+        self.feat_proj = nn.Sequential(
+            nn.Conv2d(1024, d_model, 1), nn.GELU(),
+            nn.Conv2d(d_model, d_model, 3, padding=1), nn.GELU(),
+            nn.Conv2d(d_model, d_model, 3, padding=1), nn.GELU(),
+        )
+
+        # 2D positional encodings for img/feat grids (first-model style)
+        pos_img  = _build_2d_sincos_pos_embed(grid_hw_img, grid_hw_img, d_model)   # [G², d]
+        pos_feat = _build_2d_sincos_pos_embed(grid_hw_feat, grid_hw_feat, d_model)   # [G², d]
+        self.register_buffer("pos_img",  pos_img,  persistent=False)
+        self.register_buffer("pos_feat", pos_feat, persistent=False)
+
+        # Token-type embeddings: 0=CLS, 1=pose, 2=time, 3=feat, 4=img
         self.token_type = nn.Embedding(5, d_model)
-
-        # Per-view token layout: [CLS, pose, time, feat×F, img×I]
         type_ids_view = [0, 1, 2] + [3]*self.n_feat_tokens + [4]*self.n_img_tokens
-        self.K = len(type_ids_view)  # tokens per view (1+1+1+grid^2+grid^2 = 3 + 2*grid^2)
-        self.register_buffer("type_ids_view", torch.tensor(type_ids_view, dtype=torch.long), persistent=False)
+        self.K = len(type_ids_view)  # tokens per view
+        self.register_buffer("type_ids_view", torch.tensor(type_ids_view, dtype=torch.long),
+                             persistent=False)
 
-        # ----------- Learnable view summary token -----------
+        # Learnable per-view CLS token (shared across views)
         self.view_cls = nn.Parameter(torch.zeros(1, 1, 1, d_model))  # [1,1,1,d]
 
-        # ----------- Alternating intra/inter stacks -----------
-        self.intra_blocks = nn.ModuleList([
-            TransformerBlock(d_model, num_heads, mlp_ratio=4.0, dropout=dropout) for _ in range(num_att_blocks)
-        ])
-        self.inter_blocks = nn.ModuleList([
-            TransformerBlock(d_model, num_heads, mlp_ratio=4.0, dropout=dropout) for _ in range(num_att_blocks)
-        ])
+        def make_layer():
+            return nn.TransformerEncoderLayer(
+                d_model=d_model, nhead=num_heads,
+                dim_feedforward=d_model * 2,
+                dropout=dropout, batch_first=True, norm_first=True
+            )
+        n_intra = (num_layers + 1) // 2  # start with intra
+        n_inter = num_layers // 2
+        self.intra_layers = nn.ModuleList([make_layer() for _ in range(n_intra)])
+        self.inter_layers = nn.ModuleList([make_layer() for _ in range(n_inter)])
 
-        # ----------- Pose head reads from the view summary token -----------
-        self.pose_head = nn.Sequential(
+        if (representation in {"quat", "exp"}) or (prediction == "noise"):
+            dim_out = 6
+        else:
+            dim_out = 9
+        
+
+        self.output_proj = nn.Sequential(
             nn.LayerNorm(d_model),
-            nn.Linear(d_model, 2*d_model), nn.SiLU(), nn.Dropout(dropout),
-            nn.Linear(2*d_model, d_model), nn.SiLU(), nn.Dropout(dropout),
+            nn.Linear(d_model, d_model), nn.SiLU(), nn.Dropout(dropout),
             nn.Linear(d_model, dim_out)
         )
 
-    # ----- Tokenizers -----
+
     def _pose_tokens(self, R, T):
         B, N = R.shape[:2]
         pose_vec = torch.cat([R.reshape(B, N, 9), T], dim=-1)      # [B,N,12]
         return self.pose_proj(pose_vec)                            # [B,N,d]
 
-    def _time_tokens(self, t, B, N, device):
+    def _time_tokens(self, t, B, N, device, dtype):
         if isinstance(t, (int, float)):
-            t = torch.full((B, N), int(t), device=device)
-        elif t.ndim == 1:
-            t = t[:, None].expand(-1, N)
-        t = t.long()
+            t = torch.full((B, N, 1), int(t), device=device, dtype=dtype)
+        else:
+            if t.ndim == 2:
+                t = t.unsqueeze(-1)
+            t = t.to(device=device, dtype=dtype)
         return self.time_embed(t)                                  # [B,N,d]
 
     def _image_tokens(self, imgs):
-        # imgs: [B,N,3,H,W] → [B,N,grid^2,d]
+        # imgs: [B,N,3,H,W] → [B,N,G²,d] + 2D PE
         B, N = imgs.shape[:2]
         x = imgs.view(B*N, *imgs.shape[2:])                        # [B*N,3,H,W]
-        x = self.img_backbone(x)                                   # [B*N,d,grid,grid]
-        x = x.flatten(2).transpose(1, 2)                           # [B*N,grid^2,d]
-        x = x + self.pos_img.unsqueeze(0)                          # add 2D PE
-        return x.view(B, N, self.n_img_tokens, self.d_model)       # [B,N,grid^2,d]
+        x = self.img_backbone(x)                                   # [B*N,d,G,G]
+        x = x.flatten(2).transpose(1, 2)                          
+        x = x + self.pos_img.unsqueeze(0)                          # add PE
+        return x.view(B, N, self.n_img_tokens, self.d_model)       # [B,N,G²,d]
 
     def _feat_tokens(self, feats):
-        # feats: [B,N,1024,14,14] → [B,N,grid^2,d]
+        # feats: [B,N,1024,Hf,Wf] → [B,N,G²,d] + 2D PE
         B, N = feats.shape[:2]
-        f = self.feat_proj(feats.view(B*N, *feats.shape[2:]))      # [B*N,d,14,14]
-        f = F.adaptive_avg_pool2d(f, (self.grid_hw, self.grid_hw)) # [B*N,d,grid,grid]
-        f = f.flatten(2).transpose(1, 2)                           # [B*N,grid^2,d]
-        f = f + self.pos_feat.unsqueeze(0)                         # add 2D PE
-        return f.view(B, N, self.n_feat_tokens, self.d_model)      # [B,N,grid^2,d]
+        f = self.feat_proj(feats.view(B*N, *feats.shape[2:]))      # [B*N,d,Hf,Wf]
+        f = F.adaptive_avg_pool2d(f, (self.grid_hw_feat, self.grid_hw_feat)) 
+        f = f.flatten(2).transpose(1, 2)                         
+        f = f + self.pos_feat.unsqueeze(0)                         # add PE
+        return f.view(B, N, self.n_feat_tokens, self.d_model)      # [B,N,G²,d]
 
     # ----- Forward -----
     def forward(self, R, T, feats, imgs, t):
+        """
+        Inputs:
+          R:     [B,N,3,3]
+          T:     [B,N,3]
+          feats: [B,N,1024,Hf,Wf]
+          imgs:  [B,N,3,H,W]
+          t:     int or [B,N] (ints)
+        Output: [B,N,4,4] pose
+        """
         B, N = R.shape[:2]
         d = self.d_model
         K = self.K
 
-        pose_tok = self._pose_tokens(R, T)                          # [B,N,d]
-        time_tok = self._time_tokens(t if torch.is_tensor(t) else torch.tensor(t, device=R.device),
-                                     B, N, device=R.device)         # [B,N,d]
-        feat_tok = self._feat_tokens(feats)                         # [B,N,grid^2,d]
-        img_tok  = self._image_tokens(imgs)                         # [B,N,grid^2,d]
+        pose_tok = self._pose_tokens(R, T)                         # [B,N,d]
+        time_tok = self._time_tokens(t, B, N, device=R.device,
+                                     dtype=pose_tok.dtype)         # [B,N,d]
+        feat_tok = self._feat_tokens(feats)                      
+        img_tok  = self._image_tokens(imgs)               
 
-        view_cls = self.view_cls.expand(B, N, 1, d)                 # [B,N,1,d]
+        view_cls = self.view_cls.expand(B, N, 1, d)                # [B,N,1,d]
 
         tokens = torch.cat([
-            view_cls,                                               # [B,N,1,d]
-            pose_tok.unsqueeze(2),                                  # [B,N,1,d]
-            time_tok.unsqueeze(2),                                  # [B,N,1,d]
-            feat_tok,                                               # [B,N,grid^2,d]
-            img_tok                                                 # [B,N,grid^2,d]
-        ], dim=2)                                                   # [B,N,K,d]  (K = 3 + 2*grid^2; with grid=3 → K=21)
+            view_cls,                                              # [B,N,1,d]
+            pose_tok.unsqueeze(2),                                 # [B,N,1,d]
+            time_tok.unsqueeze(2),                                 # [B,N,1,d]
+            feat_tok,                                          
+            img_tok                                       
+        ], dim=2)                                                  # [B,N,K,d]
 
-        type_emb = self.token_type(self.type_ids_view.to(tokens.device))  # [K,d]
-        tokens = tokens + type_emb[None, None, :, :]                      # [B,N,K,d]
+        type_emb = self.token_type(self.type_ids_view.to(tokens.device))                # [K,d]
+        x = tokens + type_emb.view(1, 1, K, d)                       # [B,N,K,d]
 
-        x = tokens
-        for intra, inter in zip(self.intra_blocks, self.inter_blocks):
-            x = x.reshape(B * N, K, d)            # intra (per view)
-            x = intra(x)
-            x = x.view(B, N, K, d)
+        intra_i, inter_i = 0, 0
+        for k in range(self.num_layers):
+            if k % 2 == 0:
+                y = x.reshape(B * N, K, d)                         # intra per view
+                y = self.intra_layers[intra_i](y)
+                x = y.view(B, N, K, d)
+                intra_i += 1
+            else:
+                y = x.view(B, N * K, d)                            # inter across views
+                y = self.inter_layers[inter_i](y)
+                x = y.view(B, N, K, d)
+                inter_i += 1
 
-            x = x.view(B, N * K, d)               # inter (across views)
-            x = inter(x)
-            x = x.view(B, N, K, d)
+        pose_slot = x[:, :, 1, :]                                                  # [B,N,d]
+        out_vec   = self.output_proj(pose_slot)    
 
-        view_summ = x[:, :, 0, :]                 # [B,N,d]
-        pose_preds = self.pose_head(view_summ)    # [B,N,dim_out]
-        return pose_preds
+        if self.representation == "rot6d":
+            return vec_to_pose(out_vec.reshape(B*N, 9), self.representation).reshape(B, N, 4, 4)
+        elif self.prediction == "noise":
+            return out_vec.reshape(B*N, 6).reshape(B, N, 4, 4)
+        else:
+            return vec_to_pose(out_vec.reshape(B*N, 6), self.representation).reshape(B, N, 4, 4)
+
+class PreNorm(nn.Module):
+    def __init__(self, dim, fn):
+        super().__init__()
+        self.norm = nn.LayerNorm(
+            dim) if dim is not None else lambda x: torch.nn.functional.normalize(x, dim=-1)
+        self.fn = fn
+
+    def forward(self, x, **kwargs):
+        return self.fn(self.norm(x), **kwargs)
+        
+
+class PRoPEAttention(nn.Module):
+    """
+    Multi-head attention that wraps PRoPE around SDPA.
+    - Projects tokens to Q/K/V
+    - Applies PRoPE transforms (q/k/v)
+    - Calls SDPA 
+    - Applies inverse PRoPE on outputs
+    """
+    def __init__(self, dim, heads, head_dim, patches_x, patches_y, image_width, image_height, dropout=0.):
+        super().__init__()
+        assert dim == heads * head_dim, "dim must equal heads * head_dim"
+        assert head_dim % 4 == 0, "PRoPE requires head_dim % 4 == 0"
+
+        self.dim = dim
+        self.heads = heads
+        self.head_dim = head_dim
+        self.patches_x = patches_x
+        self.patches_y = patches_y
+        self.image_width = image_width
+        self.image_height = image_height
+
+        self.qkv  = nn.Linear(dim, 3 * dim, bias=False)
+        self.proj = nn.Linear(dim, dim, bias=False)
+        self.drop = nn.Dropout(dropout)
+
+        self.prope = PropeDotProductAttention(
+            head_dim   = head_dim,
+            patches_x  = patches_x,
+            patches_y  = patches_y,
+            image_width  = image_width,
+            image_height = image_height,
+        )
+
+    def forward(self, x, viewmats, Ks=None, attn_mask=None, is_causal=False):
+        """
+        x:        (B, L, D) where L = cameras * (patches_x * patches_y)
+        viewmats: (B, cameras, 4, 4)
+        Ks:       (B, cameras, 3, 3) or None
+        """
+        B, L, D = x.shape
+        H, Dh   = self.heads, self.head_dim
+        cams    = viewmats.shape[1]
+        per_cam = self.patches_x * self.patches_y
+        assert L == cams * per_cam, f"seq len {L} != cameras({cams})*patches({per_cam})"
+
+        self.prope._precompute_and_cache_apply_fns(viewmats=viewmats, Ks=Ks)
+
+        qkv = self.qkv(x).view(B, L, 3, H, Dh).permute(0, 3, 1, 2, 4)
+        q, k, v = qkv.unbind(dim=3)
+
+        q = self.prope._apply_to_q(q)
+        k = self.prope._apply_to_kv(k)
+        v = self.prope._apply_to_kv(v)
+
+        with sdpa_kernel([SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]):
+            out = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+
+        y = self.prope._apply_to_o(out)                           # (B,H,L,Dh)
+        y = y.permute(0, 2, 1, 3).contiguous().view(B, L, D)    # (B,L,D)
+        return self.drop(self.proj(y))
+
+class RayRoPEAttention(nn.Module):
+    def __init__(self, dim, heads, head_dim, patches_x, patches_y, image_width, image_height, dropout=0.):
+        super().__init__()
+        assert dim == heads * head_dim
+
+        self.patches_x = patches_x
+        self.patches_y = patches_y
+        self.image_width = image_width
+        self.image_height = image_height
+        self.dropout = dropout
+
+        self.rayrope_attn = RayRoPE_DotProductAttention(
+            head_dim=head_dim,
+            patches_x=patches_x,
+            patches_y=patches_y,
+            image_width=image_width,
+            image_height=image_height,
+        )
+
+        # IMPORTANT: RayRoPE needs depth+sigma (2 dims) 
+        self.mha_layer = MultiheadAttention(
+            embed_dim=dim,
+            num_heads=heads,
+            dropout=dropout,
+            predict_d='predict_dsig',
+            sdpa_fn=self.rayrope_attn.forward,
+        )
+
+    def forward(self, x, w2cs, Ks=None, attn_mask=None, is_causal=False, context_depths=None):
+        # Cache ray geometry for this forward
+        self.rayrope_attn._precompute_and_cache_apply_fns(w2cs, Ks, context_depths=context_depths)
+
+        # Call token-in MHA; it will:
+        #  - project to q/k/v
+        #  - (optionally) predict depth+sigma per token and pass it to RayRoPE
+        #  - call RayRoPE SDPA
+        with sdpa_kernel([SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]):
+            y = self.mha_layer(x, x, x)
+
+        return y
+
+class RoPEAttention(nn.Module):
+    def __init__(self, dim, heads, head_dim, rotary_dim=32, dropout=0.):
+        super().__init__()
+        assert dim == heads * head_dim, "dim must equal heads * head_dim"
+        assert head_dim % 2 == 0, "head_dim must be multiple of 2 for RoPE"
+
+        self.dim = dim
+        self.heads = heads
+        self.head_dim = head_dim
+        self.rotary_dim = head_dim
+        self.attn_drop = nn.Dropout(dropout)
+        self.proj_drop = nn.Dropout(dropout)
+
+        self.qkv = nn.Linear(dim, 3 * dim, bias=False)
+        self.proj = nn.Linear(dim, dim, bias=False)
+        self.rotary_emb = RotaryEmbedding(dim=rotary_dim)
+
+    def forward(self, x, attn_mask=None, is_causal=False):
+        """
+        x: (B, L, D)
+        """
+        B, L, D = x.shape
+        
+        H, Dh = self.heads, self.head_dim
+
+        qkv = self.qkv(x).view(B, L, 3, H, Dh).permute(0, 3, 1, 2, 4)
+        q, k, v = qkv.unbind(dim=3)  # (B, H, L, Dh)
+
+        # Apply rotary embedding to Q and K only
+        q = self.rotary_emb.rotate_queries_or_keys(q)
+        k = self.rotary_emb.rotate_queries_or_keys(k)
+
+
+        with sdpa_kernel([SDPBackend.MATH]):
+            y = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=attn_mask,
+                dropout_p=self.attn_drop.p if self.training else 0.0,
+                is_causal=is_causal
+            )
+
+        y = y.view(B, H, L, Dh).permute(0, 2, 1, 3).reshape(B, L, D)
+        return self.proj_drop(self.proj(y))
+
+class PoseToPoseAttn(nn.Module):
+    """
+    Attention among special tokens across views.
+
+    Modes:
+      - concatenate_pairs=True : N tokens of size 2D  (per-view concat of [view_tok, cls_tok])
+      - concatenate_pairs=False: 2N tokens of size D  (self-attn over all specials)
+    Returns: [B, N, 2, D]
+    """
+    def __init__(self, dim, heads, dropout=0.0, time_dim=None, concatenate_pairs=False, head_dim=None):
+        super().__init__()
+        self.concatenate_pairs = concatenate_pairs
+        self.dim = dim
+        self.heads = heads
+        self.drop = nn.Dropout(dropout)
+
+        attn_dim = 2 * dim if concatenate_pairs else dim
+        if head_dim is None:
+            assert attn_dim % heads == 0, "attn_dim must be divisible by heads"
+            head_dim = attn_dim // heads
+        self.head_dim = head_dim
+        assert attn_dim == heads * head_dim, "attn_dim must equal heads * head_dim"
+
+        self.ln = nn.LayerNorm(attn_dim)
+        self.qkv = nn.Linear(attn_dim, 3 * attn_dim, bias=False)
+        self.proj = nn.Linear(attn_dim, attn_dim, bias=False)
+
+        self.use_time = time_dim is not None
+        if self.use_time:
+            self.time_to_bias = nn.Sequential(
+                nn.Linear(time_dim, dim),
+                nn.Tanh()
+            )
+
+    def forward(self, specials, time_emb=None, attn_mask=None, is_causal=False):
+        """
+        specials: [B, N, 2, D]  (two specials per view)
+        time_emb: [B, N, T]     optional
+        attn_mask: broadcastable to (B*H, L, L)
+        """
+        B, N, S, D = specials.shape
+        assert S == 2 and D == self.dim
+
+        if self.use_time and time_emb is not None:
+            bias = self.time_to_bias(time_emb).unsqueeze(2)  # [B,N,1,D]
+            specials = specials + bias
+
+        H, Dh = self.heads, self.head_dim
+
+        if self.concatenate_pairs:
+            x = specials.reshape(B, N, 2 * D)          # [B,N,2D]
+            x_ln = self.ln(x)
+            qkv = self.qkv(x_ln).view(B, N, 3, H, Dh).permute(0, 3, 1, 2, 4)
+            q, k, v = qkv.unbind(dim=3)               # [B,H,N,Dh]
+
+            with sdpa_kernel([SDPBackend.MATH]):
+                y = F.scaled_dot_product_attention(q, k, v,
+                                                attn_mask=attn_mask,
+                                                dropout_p=0.0,
+                                                is_causal=is_causal)   # [B*H,N,Dh]
+
+            y = y.view(B, H, N, Dh).permute(0, 2, 1, 3).reshape(B, N, H*Dh)  # [B,N,2D]
+            y = self.drop(self.proj(y))
+            out = x + y
+            return out.reshape(B, N, 2, D)
+
+        else:
+            # ----- Mode B: 2N tokens of size D -----
+            L = 2 * N
+            x = specials.reshape(B, L, D)             # [B,2N,D]
+            x_ln = self.ln(x)
+            qkv = self.qkv(x_ln).view(B, L, 3, H, Dh).permute(0, 3, 1, 2, 4)
+            q, k, v = qkv.unbind(dim=3)               # [B,H,2N,Dh]
+            q = q.reshape(B*H, L, Dh)
+            k = k.reshape(B*H, L, Dh)
+            v = v.reshape(B*H, L, Dh)
+
+            with sdpa_kernel([SDPBackend.MATH]):
+                y = F.scaled_dot_product_attention(q, k, v,
+                                                attn_mask=attn_mask,
+                                                dropout_p=0.0,
+                                                is_causal=is_causal)   # [B*H,2N,Dh]
+
+            y = y.view(B, H, L, Dh).permute(0, 2, 1, 3).reshape(B, L, H*Dh)  # [B,2N,D]
+            y = self.drop(self.proj(y))
+            out = x + y
+            return out.reshape(B, N, 2, D)
+
+class DiffusionAttentionBlock(nn.Module):
+    def __init__(
+        self,
+        dim, heads, dim_head, mlp_dim,
+        patches_x, patches_y, image_width, image_height,
+        special_tokens_per_view=2, 
+        dropout=0.0,
+        use_local=True,
+        use_s2s=True,
+        use_p2s=False,
+        use_rayrope = False, 
+        use_global=True,
+        concatenate_pairs=False,
+        time_dim=None 
+    ):
+        super().__init__()
+        self.S = int(special_tokens_per_view)
+        self.P = int(patches_x * patches_y)
+
+        self.use_local        = bool(use_local)
+        self.use_s2s          = bool(use_s2s)
+        self.use_global = bool(use_global)
+        self.use_rayrope = bool(use_rayrope)
+
+        # Local attention using RoPE
+        if(self.use_local):
+            self.local = (
+                RoPEAttention(
+                    dim, heads, dim_head, rotary_dim=dim_head, dropout=dropout
+                )
+            )
+            self.local_attn = PreNorm(dim, self.local)
+            self.local_ff   = PreNorm(dim, FeedForward(dim, 2*dim, dropout=dropout))
+
+
+        # Pose-to-pose attention with time conditioning
+        self.s2s = (
+            PoseToPoseAttn(dim, heads, dropout=dropout, time_dim=time_dim, concatenate_pairs=concatenate_pairs)
+            if self.use_s2s else None
+        )
+
+        # Global PRoPE attention (patches only)
+        if self.use_global:
+            if(use_rayrope): 
+                if use_rayrope:
+                    self.global_attn = PreNorm(dim, RayRoPEAttention(
+                        dim=dim, heads=heads, head_dim=dim_head,
+                        patches_x=patches_x, patches_y=patches_y,
+                        image_width=image_width, image_height=image_height,
+                        dropout=dropout
+                    ))
+                    self.global_ff = PreNorm(dim, FeedForward(dim, mlp_dim, dropout=dropout))
+            else: 
+                self.global_attn = PreNorm(dim, PRoPEAttention(
+                    dim=dim, heads=heads, head_dim=dim_head,
+                    patches_x=patches_x, patches_y=patches_y,
+                    image_width=image_width, image_height=image_height,
+                    dropout=dropout
+                ))
+                self.global_ff = PreNorm(dim, FeedForward(dim, mlp_dim, dropout=dropout))
+        else:
+            self.global_attn = None
+            self.global_ff   = None
+
+    def forward(self, x, B, N, T, extras_global=None, Ks=None, block_number = None):
+        D = x.shape[-1]
+        assert T == self.S + self.P, f"Expected T={self.S + self.P}, got {T}"
+
+        # LOCAL attention (within-view: special tokens and patches)
+        if self.use_local:
+            y = x.reshape(B * N, T, D)
+            y = self.local_attn(y) + y
+            y = self.local_ff(y) + y
+            x = y.reshape(B, N, T, D)
+
+        # Split into special tokens and patches
+        specials = x[:, :, :self.S, :]  # [B, N, S=2, D] (view_tok + cls_tok)
+        patches  = x[:, :,  self.S:, :]  # [B, N, P, D]
+
+        # GLOBAL PRoPE attention (patches only, time-agnostic)
+        if self.global_attn is not None:
+            if extras_global is None:
+                raise ValueError("Global PRoPE requires extras_global with keys 'R' and 'T'.")
+            R  = extras_global["R"]   # [B,N,3,3]
+            Tt = extras_global["T"]   # [B,N,3]
+
+            R_c2w = R.reshape(B*N, 3, 3)
+            t_c2w = Tt.reshape(B*N, 3, 1)
+
+            with torch.amp.autocast("cuda", enabled=False):
+                R_w2c = R_c2w.transpose(1, 2).float()
+                t_w2c = (-R_w2c @ t_c2w.float()).squeeze(-1)
+
+            viewmats = torch.eye(4, device=R.device, dtype=torch.float32).repeat(B*N, 1, 1)
+            viewmats[:, :3, :3] = R_w2c
+            viewmats[:, :3, 3]  = t_w2c
+            viewmats = viewmats.view(B, N, 4, 4)
+            
+            y = patches.reshape(B, N * self.P, D)
+
+            if self.use_rayrope:
+                # RayRoPEAttention expects w2cs (same as viewmats here) and optional context_depths
+                context_depths = extras_global.get("context_depths", None)  # (B,N,H,W,1) if you ever have it
+                y = self.global_attn(y, w2cs=viewmats, Ks=Ks, context_depths=context_depths) + y
+            else:
+                y = self.global_attn(y, viewmats=viewmats, Ks=Ks) + y
+            y = self.global_ff(y) + y
+            patches = y.reshape(B, N, self.P, D)
+
+        # S2S: Pose-to-pose attention WITH light time conditioning
+        if self.s2s is not None:
+            time_emb = extras_global.get("time_emb", None) if extras_global else None
+            specials = self.s2s(specials, time_emb=time_emb)
+        
+
+        out = torch.cat([specials, patches], dim=2)
+
+        return out
+
+
+class OldPRoPEUpdatePoseTransformer(nn.Module):
+    def __init__(self,
+                 d_model: int = 1024,
+                 num_layers: int = 12,
+                 num_heads: int = 8,
+                 dropout: float = 0.0,
+                 device: str = "cuda",
+                 representation: str = "rot9d",
+                 update_type: str = "mult", 
+                 feature_type = "dust3r", 
+                 img_size: int = 224,
+                 prediction = "pose",
+                 grid_hw_img: int = 0, 
+                 attn_args: Optional[dict] = None, 
+                 scheme = "PRoPE",
+                 attn_kwargs: Optional[dict] = None): 
+
+        super().__init__()
+        self.device = device
+        self.representation = representation
+        self.update_type = update_type
+        self.feature_type = feature_type
+        if(feature_type == "dust3r"): 
+            self.grid_hw_feat = 14
+            self.num_heads = num_heads
+            self.d_model = d_model
+            self.num_layers = num_layers
+        else: 
+            self.grid_hw_feat = 16
+            self.d_model = 2048
+            self.num_layers = 6
+            self.num_heads = 16
+        
+        self.scheme = scheme
+        if(self.scheme == "rayrope"):
+            use_rayrope = True
+            self.d_model = 1008
+            self.num_heads = 14
+            print("USING RAYROPE")
+
+        else:
+            use_rayrope = False
+            print("USING ", scheme)
+        self.n_feat_tokens = self.grid_hw_feat * self.grid_hw_feat
+
+        # DUSt3r features: [1024,14,14] -> [d,14,14]
+        self.feat_channel_proj = nn.Identity() if self.d_model == 1024 else nn.Conv2d(1024, self.d_model, 1, bias=False)
+
+        # 2D sincos PE
+        self.register_buffer("pos_feat",
+            _build_2d_sincos_pos_embed(self.grid_hw_feat, self.grid_hw_feat, self.d_model),
+            persistent=False
+        )
+
+        
+        # View token encoder (R,T) -> d 
+        self.view_token_init = nn.Sequential(
+            nn.Linear(12, self.d_model),
+            nn.LayerNorm(self.d_model),
+            nn.Linear(self.d_model, self.d_model), nn.SiLU(),
+            nn.Linear(self.d_model, self.d_model)
+        )
+        
+        # CLS token 
+        self.cls_token_init = nn.Parameter(torch.randn(1, 1, self.d_model) * 0.02)
+        # Time embedding
+        self.max_timesteps = 100
+        self.time_embed = nn.Embedding(self.max_timesteps, self.d_model // 2)
+        self.alpha_logits = nn.Parameter(torch.full((self.num_layers,), 1.3863))  # init 0.8
+
+        # PRoPE blocks 
+        self.blocks = nn.ModuleList([
+            DiffusionAttentionBlock(
+                dim=self.d_model, heads=self.num_heads, dim_head=self.d_model // self.num_heads, mlp_dim=2 * self.d_model,
+                patches_x=self.grid_hw_feat, patches_y=self.grid_hw_feat,
+                image_width=img_size, image_height=img_size,
+                special_tokens_per_view=2, 
+                dropout=dropout,
+                use_local=True,
+                use_s2s=True, 
+                use_global=True,
+                use_rayrope = use_rayrope, 
+                concatenate_pairs=True,
+                time_dim=self.d_model // 2  
+            )
+            for _ in range(self.num_layers)
+        ])
+
+        # Decoder: uses token + time
+        if representation == "rot9d":
+            dim_out = 12
+        elif representation == "rot6d":
+            dim_out = 9
+        if update_type == "mult":
+            dim_out = 6
+
+        self.pose_decode = nn.Sequential(
+            nn.Linear(self.d_model + self.d_model // 2, self.d_model),
+            nn.SiLU(),
+            nn.Linear(self.d_model, self.d_model),
+            nn.SiLU(),
+            nn.Linear(self.d_model, dim_out),
+        )
+
+        self.output_norm = nn.LayerNorm(self.d_model)
+        for blk in self.blocks:
+            blk.debug_grad = True
+
+        print("Initialized PRoPE Update Pose Transformer using", feature_type, " features and", update_type, " update type.")
+
+    def _feat_tokens(self, feats: torch.Tensor) -> torch.Tensor:
+        B, N, C, Hf, Wf = feats.shape
+        assert C == 1024 and Hf == self.grid_hw_feat and Wf == self.grid_hw_feat
+        x = feats.view(B * N, C, Hf, Wf)
+        x = self.feat_channel_proj(x)                         # [B*N, d, Hf, Wf]
+        x = x.flatten(2).transpose(1, 2)       # [B*N, Tf, d]
+        
+        if self.scheme not in ["PRoPE", "rayrope"]:
+            print("USING POSITIONAL EMBEDDINGS")
+            x = x + self.pos_feat.to(x.device).unsqueeze(0)
+        return x.view(B, N, Hf * Wf, self.d_model)
+
+    def _time_vec(self, t, B, N, device):
+        t = torch.as_tensor(t, device=device, dtype=torch.float32)
+
+        # allow scalar / [B] / [B,N]
+        if t.ndim == 0:
+            t = t.expand(B, N)
+        elif t.ndim == 1:
+            t = t.view(B, 1).expand(B, N)
+
+        # continuous time in (0,1], clamp away from 0
+        t = t.clamp(0.01, 1.0)
+
+        # bin to embedding indices
+        tids = ((t - 0.01) / (1.0 - 0.01) * (self.max_timesteps - 1)).round().long()
+        return self.time_embed(tids)  # [B,N,d_t]
+
+
+    def forward(self, R, T, feats, imgs, Ks, t, return_intermediate: bool = False):
+        """
+        R:[B,N,3,3], T:[B,N,3]
+        feats:[B,N,1024,14,14]
+        t: scalar or [B] or [B,N]
+        """
+        B, N = R.shape[:2]
+        d = self.d_model
+
+        # Initialize tokens
+        feat_tok = self._feat_tokens(feats)                              # [B,N,P,d]
+        
+        # View token
+        view_tok = self.view_token_init(
+            torch.cat([R.reshape(B, N, 9), T], dim=-1)
+        )  # [B,N,d]
+        
+        # CLS token
+        cls_tok = self.cls_token_init.expand(B, N, -1)                   # [B,N,d]
+        
+        # Time embedding 
+        time_vec = self._time_vec(t, B, N, device=R.device)              # [B,N,d_t]
+
+        # Build per-view sequence: [view_tok, cls_tok, feature_tokens]
+        tokens = torch.cat([
+            view_tok.unsqueeze(2),  # [B,N,1,d]
+            cls_tok.unsqueeze(2),   # [B,N,1,d]
+            feat_tok                # [B,N,P,d]
+        ], dim=2)  # [B,N,2+P,d]
+        
+        T_all = tokens.shape[2]
+
+        R_cur, t_cur = R, T
+        inter_R, inter_t = [], []
+
+        extras = {
+                "R": R_cur, 
+                "T": t_cur,
+                "time_emb": time_vec  
+            }
+
+        for L in range(self.num_layers):
+            alpha = torch.sigmoid(self.alpha_logits[L]).to(tokens.dtype)  # scalar for this layer
+            # PRoPE attention uses current geometry + time info
+            extras["R"] = R_cur
+            extras["T"] = t_cur
+
+            x = self.blocks[L](tokens, B=B, N=N, T=T_all, extras_global=extras, Ks=Ks)
+
+            x_view = x[:, :, 0, :]  # View token (geometric context)
+
+            x_view_norm = self.output_norm(x_view)
+
+            # Decode pose from pose token + time
+            decode_in = torch.cat([x_view_norm, time_vec], dim=-1)  # [B,N,d+d_t]
+            if(self.update_type == "mult"): 
+                with torch.autocast(device_type="cuda", enabled=False):
+                    upd = self.pose_decode(decode_in).view(B, N, 6)
+                    curr = Rigid(
+                        Rotation(rot_mats=R_cur.reshape(B*N, 3, 3), quats=None),
+                        t_cur.reshape(B*N, 3),
+                    )
+                    curr = curr.compose_q_update_vec(upd.reshape(B*N, 6))
+                    R_cur = curr.get_rots().get_rot_mats().reshape(B, N, 3, 3)
+                    R_cur = rot9d_to_rotmat(R_cur.reshape(B, N, 9)).reshape(B, N, 3, 3)  # project to SO(3)
+                    t_cur = curr.get_trans().reshape(B, N, 3)
+                    pose_4x4_next = curr.to_tensor_4x4().reshape(B, N, 4, 4)
+
+                    pose_4x4_next = pose_4x4_next.clone()
+                    pose_4x4_next[..., :3, :3] = R_cur
+                    pose_4x4_next[..., :3, 3]  = t_cur
+            else: 
+                pose_vec_next = self.pose_decode(decode_in)
+                pose_4x4_next = vec_to_pose(
+                    pose_vec_next.reshape(B * N, -1),
+                    self.representation
+                ).reshape(B, N, 4, 4)
+                R_cur = pose_4x4_next[..., :3, :3]
+                t_cur = pose_4x4_next[..., :3, 3]
+
+
+            Rt = R_cur
+            tt = t_cur
+            view_tok_fresh = self.view_token_init(torch.cat([Rt.reshape(B, N, 9), tt], dim=-1))
+            tokens = x.clone()
+
+            tok0 = tokens[:, :, 0, :]                               # [B,N,D] view
+            tok0_new = alpha * tok0 + (1 - alpha) * view_tok_fresh  # [B,N,D]
+
+            tokens = torch.cat([tok0_new.unsqueeze(2), tokens[:, :, 1:, :]], dim=2)
+
+            if return_intermediate:
+                inter_R.append(R_cur.clone()) 
+                inter_t.append(t_cur.clone())
+
+        out = {"R": R_cur, "t": t_cur, "pose": pose_4x4_next}
+        if return_intermediate:
+            out["R_layers"] = torch.stack(inter_R, dim=0)
+            out["t_layers"] = torch.stack(inter_t, dim=0)
+        return out
+
+class PRoPEUpdatePoseTransformer(nn.Module):
+    def __init__(self,
+                 d_model: int = 1024,
+                 num_layers: int = 12,
+                 num_heads: int = 8,
+                 dropout: float = 0.0,
+                 device: str = "cuda",
+                 representation: str = "rot9d",
+                 update_type: str = "mult", 
+                 feature_type = "dust3r", 
+                 img_size: int = 224,
+                 prediction = "pose",
+                 grid_hw_img: int = 0, 
+                 attn_args: Optional[dict] = None, 
+                 scheme = "PRoPE",
+                 attn_kwargs: Optional[dict] = None): 
+
+        super().__init__()
+        self.device = device
+        self.representation = representation
+        self.update_type = update_type
+        self.feature_type = feature_type
+        if(feature_type == "dust3r"): 
+            self.grid_hw_feat = 14
+            self.num_heads = num_heads
+            self.d_model = d_model
+            self.num_layers = num_layers
+        else: 
+            self.grid_hw_feat = 16
+            self.d_model = 2048
+            self.num_layers = 6
+            self.num_heads = 16
+        
+        self.scheme = scheme
+        if(self.scheme == "rayrope"):
+            use_rayrope = True
+            self.d_model = 1008
+            self.num_heads = 14
+
+        else:
+            use_rayrope = False
+        self.n_feat_tokens = self.grid_hw_feat * self.grid_hw_feat
+
+        # DUSt3r features: [1024,14,14] -> [d,14,14]
+        self.feat_channel_proj = nn.Identity() if self.d_model == 1024 else nn.Conv2d(1024, self.d_model, 1, bias=False)
+
+        # 2D sincos PE
+        self.register_buffer("pos_feat",
+            _build_2d_sincos_pos_embed(self.grid_hw_feat, self.grid_hw_feat, self.d_model),
+            persistent=False
+        )
+
+        
+        # View token encoder (R,T) -> d 
+        self.view_token_init = nn.Sequential(
+            nn.Linear(12, self.d_model),
+            nn.LayerNorm(self.d_model),
+            nn.Linear(self.d_model, self.d_model), nn.SiLU(),
+            nn.Linear(self.d_model, self.d_model)
+        )
+        
+        # CLS token 
+        self.cls_token_init = nn.Parameter(torch.randn(1, 1, self.d_model) * 0.02)
+        # Time embedding
+        self.max_timesteps = 100
+        self.time_embed = nn.Embedding(self.max_timesteps, self.d_model // 2)
+
+        # PRoPE blocks 
+        self.blocks = nn.ModuleList([
+            DiffusionAttentionBlock(
+                dim=self.d_model, heads=self.num_heads, dim_head=self.d_model // self.num_heads, mlp_dim=2 * self.d_model,
+                patches_x=self.grid_hw_feat, patches_y=self.grid_hw_feat,
+                image_width=img_size, image_height=img_size,
+                special_tokens_per_view=2, 
+                dropout=dropout,
+                use_local=True,
+                use_s2s=True, 
+                use_global=True,
+                use_rayrope = use_rayrope, 
+                concatenate_pairs=True,
+                time_dim=self.d_model // 2  
+            )
+            for _ in range(self.num_layers)
+        ])
+
+        # Decoder: uses token + time
+        if representation == "rot9d":
+            dim_out = 12
+        elif representation == "rot6d":
+            dim_out = 9
+        if update_type == "mult":
+            dim_out = 6
+
+        self.pose_decode = nn.Sequential(
+            nn.Linear(self.d_model + self.d_model // 2, self.d_model),
+            nn.SiLU(),
+            nn.LayerNorm(self.d_model),
+            nn.Linear(self.d_model, self.d_model),
+            nn.SiLU(),
+            nn.LayerNorm(self.d_model),
+            nn.Linear(self.d_model, dim_out),
+        )
+
+        nn.init.normal_(self.pose_decode[-1].weight, mean=0.0, std=1e-3)
+        nn.init.zeros_(self.pose_decode[-1].bias)
+
+        self.output_norm = nn.LayerNorm(self.d_model)
+
+        print("Initialized PRoPE Update Pose Transformer using", feature_type, " features ", update_type, " update type on", self.representation, "and ", scheme, "embeddings.")
+
+    def _feat_tokens(self, feats: torch.Tensor) -> torch.Tensor:
+        B, N, C, Hf, Wf = feats.shape
+        assert C == 1024 and Hf == self.grid_hw_feat and Wf == self.grid_hw_feat
+        x = feats.view(B * N, C, Hf, Wf)
+        x = self.feat_channel_proj(x)                         # [B*N, d, Hf, Wf]
+        x = x.flatten(2).transpose(1, 2)       # [B*N, Tf, d]
+        
+        if self.scheme not in ["PRoPE", "rayrope"]:
+            print("USING POSITIONAL EMBEDDINGS")
+            x = x + self.pos_feat.to(x.device).unsqueeze(0)
+        return x.view(B, N, Hf * Wf, self.d_model)
+
+    def _time_vec(self, t, B, N, device):
+        t = torch.as_tensor(t, device=device, dtype=torch.float32)
+
+        # allow scalar / [B] / [B,N]
+        if t.ndim == 0:
+            t = t.expand(B, N)
+        elif t.ndim == 1:
+            t = t.view(B, 1).expand(B, N)
+
+        # continuous time in (0,1], clamp away from 0
+        t = t.clamp(0.01, 1.0)
+
+        # bin to embedding indices
+        tids = ((t - 0.01) / (1.0 - 0.01) * (self.max_timesteps - 1)).round().long()
+        return self.time_embed(tids)  # [B,N,d_t]
+
+    def forward(self, R, T, feats, imgs, Ks, t, return_intermediate: bool = False):
+        """
+        R:[B,N,3,3], T:[B,N,3]
+        feats:[B,N,1024,14,14]
+        t: scalar or [B] or [B,N]
+        """
+        B, N = R.shape[:2]
+        d = self.d_model
+
+
+        feat_tok = self._feat_tokens(feats)
+        view_in = torch.cat([R.reshape(B, N, 9), T], dim=-1)
+
+        view_tok = self.view_token_init(view_in)
+
+        cls_tok = self.cls_token_init.expand(B, N, -1)
+
+        tokens = torch.cat([view_tok.unsqueeze(2), cls_tok.unsqueeze(2), feat_tok], dim=2)
+        
+        # Time embedding 
+        time_vec = self._time_vec(t, B, N, device=R.device)              # [B,N,d_t]
+        
+        T_all = tokens.shape[2]
+
+        R_cur, t_cur = R, T
+        inter_R, inter_t = [], []
+
+        extras = {
+                "R": R_cur, 
+                "T": t_cur,
+                "time_emb": time_vec  
+            }
+
+        for L in range(self.num_layers):
+            # PRoPE attention uses current geometry + time info
+            extras["R"] = R_cur
+            extras["T"] = t_cur
+
+            x = self.blocks[L](tokens, B=B, N=N, T=T_all, extras_global=extras, Ks=Ks, block_number = L)
+
+            x_view = x[:, :, 0, :]  # View token (geometric context)
+
+            x_view_norm = self.output_norm(x_view)
+
+            # Decode pose from pose token + time
+            decode_in = torch.cat([x_view_norm, time_vec], dim=-1)  # [B,N,d+d_t]
+            if(self.update_type == "mult"): 
+                with torch.autocast(device_type="cuda", enabled=False):
+                    upd = self.pose_decode(decode_in).view(B, N, 6)
+                    curr = Rigid(
+                        Rotation(rot_mats=R_cur.reshape(B*N, 3, 3), quats=None),
+                        t_cur.reshape(B*N, 3),
+                    )
+                    curr = curr.compose_q_update_vec(upd.reshape(B*N, 6))
+                    R_cur = curr.get_rots().get_rot_mats().reshape(B, N, 3, 3)
+                    R_cur = rot9d_to_rotmat(R_cur.reshape(B, N, 9)).reshape(B, N, 3, 3)  # project to SO(3)
+                    t_cur = curr.get_trans().reshape(B, N, 3)
+                    pose_4x4_next = curr.to_tensor_4x4().reshape(B, N, 4, 4)
+
+                    pose_4x4_next = pose_4x4_next.clone()
+                    pose_4x4_next[..., :3, :3] = R_cur
+                    pose_4x4_next[..., :3, 3]  = t_cur
+            else: 
+                pose_vec_next = self.pose_decode(decode_in)
+                pose_4x4_next = vec_to_pose(
+                    pose_vec_next.reshape(B * N, -1),
+                    self.representation
+                ).reshape(B, N, 4, 4)
+                R_cur = pose_4x4_next[..., :3, :3]
+                t_cur = pose_4x4_next[..., :3, 3]
+
+            tokens = x
+
+            if return_intermediate:
+                inter_R.append(R_cur.clone()) 
+                inter_t.append(t_cur.clone())
+
+        out = {"R": R_cur, "t": t_cur, "pose": pose_4x4_next}
+        if return_intermediate:
+            out["R_layers"] = torch.stack(inter_R, dim=0)
+            out["t_layers"] = torch.stack(inter_t, dim=0)
+        return out
+
+class RegressionNetwork(nn.Module):
+    def __init__(self,
+                 d_model: int = 1024,
+                 num_layers: int = 12,
+                 num_heads: int = 8,
+                 dropout: float = 0.0,
+                 device: str = "cuda",
+                 representation: str = "rot9d",
+                 update_type: str = "mult",
+                 feature_type = "dust3r", 
+                 img_size: int = 224,
+                 prediction = "pose",
+                 grid_hw_img: int = 0, 
+                 attn_args: Optional[dict] = None, 
+                 scheme = "PRoPE",
+                 attn_kwargs: Optional[dict] = None): 
+
+        super().__init__()
+        self.device = device
+        self.representation = representation
+        self.feature_type = feature_type
+        if(feature_type == "dust3r"): 
+            self.grid_hw_feat = 14
+            self.num_heads = num_heads
+            self.d_model = d_model
+            self.num_layers = num_layers
+        else: 
+            self.grid_hw_feat = 16
+            self.d_model = 2048
+            self.num_layers = 6
+            self.num_heads = 16
+        
+        self.scheme = scheme
+        self.n_feat_tokens = self.grid_hw_feat * self.grid_hw_feat
+        self.update_type = update_type
+
+        # 2D sincos PE
+        self.register_buffer("pos_feat",
+            _build_2d_sincos_pos_embed(self.grid_hw_feat, self.grid_hw_feat, d_model),
+            persistent=False
+        )
+
+        # View token encoder (R,T) -> d 
+        self.view_token_init = nn.Sequential(
+            nn.Linear(12, self.d_model),
+            nn.LayerNorm(self.d_model),
+            nn.SiLU(),
+            nn.Linear(self.d_model, self.d_model),
+            nn.LayerNorm(self.d_model),
+            nn.SiLU(),
+            nn.Linear(self.d_model, self.d_model),
+        )
+        nn.init.zeros_(self.view_token_init[-1].weight)
+        nn.init.zeros_(self.view_token_init[-1].bias)
+        
+        self.alpha_logits = nn.Parameter(torch.full((self.num_layers,), 1.3863))  # init 0.8
+        
+        # CLS token 
+        self.cls_token_init = nn.Parameter(torch.randn(1, 1, self.d_model) * 0.02)
+        # Time embedding
+        self.max_timesteps = 100
+
+        # PRoPE blocks 
+        self.blocks = nn.ModuleList([
+            DiffusionAttentionBlock(
+                dim=self.d_model, heads=self.num_heads, dim_head=self.d_model // self.num_heads, mlp_dim=2 * self.d_model,
+                patches_x=self.grid_hw_feat, patches_y=self.grid_hw_feat,
+                image_width=img_size, image_height=img_size,
+                special_tokens_per_view=2, 
+                dropout=dropout,
+                use_local=True,
+                use_s2s=True, 
+                use_global=False,
+                use_rayrope = False, 
+                concatenate_pairs=True,
+                time_dim=None
+            )
+            for _ in range(self.num_layers)
+        ])
+
+        # Decoder: uses token + time
+        if representation == "rot9d":
+            dim_out = 12
+        elif representation == "rot6d":
+            dim_out = 9
+            
+        if self.update_type == "mult":
+            dim_out = 6
+
+        self.pose_decode = nn.Sequential(
+            nn.Linear(self.d_model, self.d_model),
+            nn.SiLU(),
+            nn.LayerNorm(self.d_model),
+            nn.Linear(self.d_model, self.d_model),
+            nn.SiLU(),
+            nn.LayerNorm(self.d_model),
+            nn.Linear(self.d_model, dim_out),
+        )
+
+        self.output_norm = nn.LayerNorm(self.d_model)
+        print("Initialized PRoPE Update Pose Transformer")
+
+    def _feat_tokens(self, feats: torch.Tensor) -> torch.Tensor:
+        B, N, C, Hf, Wf = feats.shape
+        assert C == self.d_model and Hf == self.grid_hw_feat and Wf == self.grid_hw_feat
+        x = feats.view(B * N, C, Hf, Wf)
+        #x = self.feat_channel_proj(x)                         # [B*N, d, Hf, Wf]
+        x = x.flatten(2).transpose(1, 2)       # [B*N, Tf, d]
+        
+        if not self.scheme == "PRoPE":
+            x = x + self.pos_feat.to(x.device).unsqueeze(0)
+        return x.view(B, N, Hf * Wf, self.d_model)
+
+    def forward(self, feats, imgs, Ks, return_intermediates: bool = False):
+        """
+        R:[B,N,3,3], T:[B,N,3]
+        feats:[B,N,1024,14,14]
+        t: scalar or [B] or [B,N]
+        """
+        B, N = feats.shape[:2]
+        device = feats.device
+        R = torch.eye(3, device=device).expand(B, N, 3, 3).clone()
+        T = torch.zeros((B, N, 3), device=device)
+
+        d = self.d_model
+
+        # Initialize tokens
+        feat_tok = self._feat_tokens(feats)                              # [B,N,P,d]
+        
+
+        view_tok = self.view_token_init(
+            torch.cat([R.reshape(B, N, 9), T], dim=-1)
+        )  # [B,N,d]
+        
+        # CLS token
+        cls_tok = self.cls_token_init.expand(B, N, -1)                   # [B,N,d]
+
+        # Build per-view sequence: [view_tok, cls_tok, feature_tokens]
+        tokens = torch.cat([
+            view_tok.unsqueeze(2),  # [B,N,1,d]
+            cls_tok.unsqueeze(2),   # [B,N,1,d]
+            feat_tok                # [B,N,P,d]
+        ], dim=2)  # [B,N,2+P,d]
+        
+        T_all = tokens.shape[2]
+
+        R_cur, t_cur = R, T
+        inter_R, inter_t = [], []
+
+        extras = {
+                "R": R_cur, 
+                "T": t_cur,
+            }
+
+        for L in range(self.num_layers):
+            alpha = torch.sigmoid(self.alpha_logits[L]).to(tokens.dtype)  # scalar for this layer
+            extras["R"] = R_cur
+            extras["T"] = t_cur
+
+            x = self.blocks[L](tokens, B=B, N=N, T=T_all, extras_global=extras, Ks=Ks)
+
+            x_view = x[:, :, 0, :]  # View token (geometric context)
+
+            x_view_norm = self.output_norm(x_view)
+
+            decode_in = x_view_norm
+            if(self.update_type == "mult"): 
+                upd = self.pose_decode(decode_in).view(B, N, 6)
+                curr = Rigid(
+                    Rotation(rot_mats=R_cur.reshape(B*N, 3, 3), quats=None),
+                    t_cur.reshape(B*N, 3),
+                )
+                curr = curr.compose_q_update_vec(upd.reshape(B*N, 6))
+                R_cur = curr.get_rots().get_rot_mats().reshape(B, N, 3, 3)
+                t_cur = curr.get_trans().reshape(B, N, 3)
+                pose_4x4_next = curr.to_tensor_4x4().reshape(B, N, 4, 4)
+            else: 
+                pose_vec_next = self.pose_decode(decode_in)
+                pose_4x4_next = vec_to_pose(
+                    pose_vec_next.reshape(B * N, -1),
+                    self.representation
+                ).reshape(B, N, 4, 4)
+                R_cur = pose_4x4_next[..., :3, :3]
+                t_cur = pose_4x4_next[..., :3, 3]
+
+            Rt = R_cur
+            tt = t_cur
+            view_tok_fresh = self.view_token_init(torch.cat([Rt.reshape(B, N, 9), tt], dim=-1))
+            tokens = x.clone()
+
+            tok0 = tokens[:, :, 0, :]                               # [B,N,D] view
+            tok0_new = alpha * tok0 + (1 - alpha) * view_tok_fresh  # [B,N,D]
+
+            tokens = torch.cat([tok0_new.unsqueeze(2), tokens[:, :, 1:, :]], dim=2)
+
+            if return_intermediates:
+                inter_R.append(R_cur.clone()) 
+                inter_t.append(t_cur.clone())
+
+        out = {"R": R_cur, "t": t_cur, "pose": pose_4x4_next}
+        if return_intermediates:
+            out["R_layers"] = torch.stack(inter_R, dim=0)
+            out["t_layers"] = torch.stack(inter_t, dim=0)
+        return out

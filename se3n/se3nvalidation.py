@@ -1,24 +1,3 @@
-import os
-import os.path as osp
-import json
-import random
-import argparse
-import logging
-from typing import List, Optional
-import math
-
-import numpy as np
-from pathlib import Path
-import torch
-from tqdm import tqdm
-
-from pi3.models.pi3 import Pi3
-from pi3.relpose.metric import se3_to_relative_pose_error, calculate_auc_np
-
-from pi3.datasets.co3dv2_dataset import CO3DV2Dataset 
-from torch.utils.data import Sampler, RandomSampler, SequentialSampler, DataLoader
-from pi3.datasets.co3d_v2 import Co3dDataset
-
 import argparse, os, sys, json, time
 import yaml
 import sys
@@ -26,7 +5,7 @@ from pathlib import Path
 from visualizations import plot_so3_probabilities_full, validation_statistics
 from SE3NDiffusion import se3n_diffuser
 from SE3NRegression import se3n_regressor
-from se3n_datasets import PoseCo3DDataset, DynamicBatchSampler
+from se3n_datasets import PoseCo3DDataset, DynamicBatchSampler, VisCo3DDataset
 from feature_extractors import Dust3rFeatureExtractor, compute_dust3r_feats, compute_pi3_feats, Pi3FeatureExtractor
 import os, socket, pathlib, stat
 import json, argparse
@@ -78,7 +57,7 @@ def init_dist_and_device():
 parser = argparse.ArgumentParser()
 parser.add_argument("--config", required=True)
 parser.add_argument("--load", required=False)
-parser.add_argument("--samples", required=False, default = 10)
+parser.add_argument("--samples", required=False, default = 5)
 parser.add_argument("--epochs", type = int, required=False, default = -1)
 args = parser.parse_args()
 
@@ -105,9 +84,8 @@ num_sequences = cfg["num_sequences"]
 plot_name = cfg["plot_name"]
 BATCH_GLOBAL = cfg["batch_size"]
 feature_type = cfg["feature_type"]
-update_type = cfg["update_type"]
 prediction_type = cfg["prediction_type"]
-normalization_type = cfg["normalization_type"]
+update_type = cfg["update_type"]
 MICRO_BATCH  = BATCH_GLOBAL
 
 load = args.load
@@ -122,15 +100,13 @@ os.environ["WANDB_DIR"] = str(wandb_root / "runs")            # run logs/metadat
 os.environ["WANDB_CACHE_DIR"] = str(wandb_root / "cache")     # artifact cache (the big one)
 os.environ["WANDB_ARTIFACT_DIR"] = str(wandb_root / "artifacts")  # downloaded artifacts
 os.environ["WANDB_START_METHOD"] = "thread"   # avoids some multiprocessing edge cases
-
 num_workers = 4
 
 
 is_dist, device, local_rank = init_dist_and_device()
 world_size = dist.get_world_size() if is_dist else 1
 
-#accelerator = Accelerator(mixed_precision="bf16")
-accelerator = Accelerator(mixed_precision="no")
+accelerator = Accelerator(mixed_precision="bf16")
 
 print("[INFO] Torch version:", torch.__version__)
 print("[INFO] CUDA version:", torch.version.cuda)
@@ -139,57 +115,48 @@ print(f"[INFO] Conditioning: {conditioning}")
 print(f"[INFO] Features: {feature_type}")
 print(f"[INFO]  Dataset:      {co3d_root}")
 
-if conditioning == "CO3D":
+
+if conditioning == "depths":
+    dataset = RGBDepthDataset(data_dir)
+    val_dataset = RGBDepthDataset(val_data_dir) if val_data_dir else None
+elif conditioning == "features":
+    dataset = RGBFeatureDataset(data_dir, device="cuda", invert = False)
+    val_dataset = RGBFeatureDataset(val_data_dir, device="cuda", invert = False) if val_data_dir else None
+    train_dataloader = DataLoader(dataset,
+                                    batch_size=BATCH_GLOBAL,
+                                    shuffle=True,
+                                    num_workers=num_workers,
+                                    pin_memory=True,
+                                    drop_last = True)
+elif conditioning == "CO3D":
     if(feature_type == "dust3r"):
         extractor = Dust3rFeatureExtractor(
             ckpt_path=Path("/vast/projects/kostas/geometric-learning/mgjacob/checkpoints/DUSt3R_ViTLarge_BaseDecoder_512_dpt.pth"),
             device=str(device)  
-        ).eval()
+        )
     elif(feature_type == "pi3"):
         extractor = Pi3FeatureExtractor(
             ckpt_path=Path("/vast/projects/kostas/geometric-learning/pi3_weights/model.safetensors"),
             device=str(device)  
         )
 
-    if(normalization_type == "center_cameras"):
-        print("Using camera centric normalization")
-        train_dataset = PoseCo3DDataset(
-            co3d_root=co3d_root,
-            categories=("backpack",), 
-            resize_hw=(224, 224),
-            verbose=True, 
-            ann_root=ann_root,           
-            split="train",               
-            )
-        
-        val_dataset = PoseCo3DDataset(
-            co3d_root=co3d_root,
-            categories=("backpack",),
-            resize_hw=(224, 224),
-            verbose=True, 
-            ann_root=ann_root,           
-            split="test",               
-        )
-    else: 
-        train_dataset = VisCo3DDataset(
-            co3d_root=co3d_root,
-            categories=("backpack",), 
-            resize_hw=(224, 224),
-            verbose=True, 
-            ann_root=ann_root,           
-            split="train",               
-        )
-
-        val_dataset = VisCo3DDataset(
-            co3d_root=co3d_root,
-            categories=("backpack",),
-            resize_hw=(224, 224),
-            verbose=True, 
-            ann_root=ann_root,           
-            split="test",               
-        )
+    train_dataset = PoseCo3DDataset(
+        co3d_root=co3d_root,
+        categories=("backpack",), 
+        resize_hw=(224, 224),
+        verbose=True, 
+        ann_root=ann_root,           
+        split="train",               
+    )
     print("[INFO] TRAINING DATASET LENGTH=", len(train_dataset))  # must be > 0
-
+    val_dataset = PoseCo3DDataset(
+        co3d_root=co3d_root,
+        categories=("backpack",),
+        resize_hw=(224, 224),
+        verbose=True, 
+        ann_root=ann_root,           
+        split="test",               
+    )
     print("[INFO] VAL DATASET LENGTH =", len(val_dataset))  # must be > 0
 
     common = sorted(set(train_dataset.sequence_list) & set(val_dataset.sequence_list))
@@ -215,8 +182,8 @@ if conditioning == "CO3D":
         dataset = Subset(dataset, subset_idx)
         print(f"⚠️ Using only {len(dataset)} samples out of the full set")
 
-    sampler = DynamicBatchSampler(len(train_dataset), dataset_len = BATCH_GLOBAL, max_images = 300, images_per_seq = [2, 6])
-    val_sampler = DynamicBatchSampler(len(val_dataset), dataset_len = BATCH_GLOBAL, max_images = 300, images_per_seq = [2, 6])
+    sampler = DynamicBatchSampler(len(train_dataset), dataset_len = BATCH_GLOBAL, max_images = 6, images_per_seq = [5,6])
+    val_sampler = DynamicBatchSampler(len(val_dataset), dataset_len = BATCH_GLOBAL, max_images = 6, images_per_seq = [5, 6])
     train_dataloader = DataLoader(
         train_dataset,   
         batch_sampler=sampler,              
@@ -244,6 +211,9 @@ print("[INFO] model path: ", model_path)
 se3_config = {
     "T": 100,
     "device": device,
+    "is_dist": is_dist,
+    "local_rank": local_rank,
+    "world_size": world_size,
     "conditioning": conditioning,
     "dataloader": train_dataloader,
     "attn_args": attn_args, 
@@ -257,12 +227,15 @@ se3_config = {
     "r3_config": r3_config,
     "save_path": output_dir / "model.pt",
     "model_path": model_path,
+    "dataset_root": co3d_root,
+    "dataset": train_dataset,
+    "num_workers": num_workers,
     "forward_process": "ve", 
-    "representation": "rot6d", 
+    "representation": "rot9d", 
     "scheme": scheme,
     "accelerator": accelerator, 
     "update_type": update_type,
-    "normalization_type": normalization_type
+    "guidance_type": "ggs"
 }
 
 if(prediction_type == "regressor"):
@@ -272,32 +245,9 @@ else:
     se3n = se3n_diffuser(se3_config)
 
 
-job_id = os.environ.get("SLURM_JOB_ID", "nojid")
-
-wandb_run = wandb.init(
-    project="se3pose",
-    entity="mgjacob914-university-of-pennsylvania",
-    config=se3_config, 
-    dir=str(wandb_root / "runs"),
-    name=run_name,           
-)
-
-losses = se3n.train_co3d(train_dataloader, num_epochs=epochs, wandb_run=wandb_run)
-wandb_run.finish()
-
-plt.figure()
-plt.plot(losses)
-plt.xlabel("Epoch")
-plt.ylabel("Loss")
-plt.title(f"SE(3) Diffusion Training Loss ({run_name})")
-plt.grid(True)
-plt.savefig(output_dir / f"loss_curve_{plot_name}.png")
-plt.close()
-
-
 #PRINT FINAL LOSSES 
-losses = se3n.val_co3d(train_dataloader, num_epochs=5)
-losses = se3n.val_co3d(val_dataloader, num_epochs=5)
+losses = se3n.val_co3d(train_dataloader, num_epochs=0)
+losses = se3n.val_co3d(val_dataloader, num_epochs=0)
 plt.figure()
 plt.plot(losses)
 plt.xlabel("Epoch")
@@ -307,5 +257,21 @@ plt.grid(True)
 plt.savefig(output_dir / f"validation_loss_curve_{plot_name}.png")
 plt.close()
 
-validation_statistics(se3n, train_dataloader, k = num_samples)
-validation_statistics(se3n, val_dataloader, k = num_samples)
+#out = se3n.eval_loss_by_timestep(train_dataloader, t_values, max_batches=50)
+#print(out)
+#out = se3n.eval_loss_by_timestep(val_dataloader, t_values, max_batches=50)
+#print(out)
+dictionary = validation_statistics(se3n, train_dataloader, k = 1)
+metrics = dictionary["pooled"]
+
+print("\n=== TRAINING SET===")
+for k, v in metrics.items():
+        print(f"{k:8s}: {v:6.2f}")
+
+"""
+print("\n=== VALIDATION SET===")
+dictionary = validation_statistics(se3n, val_dataloader, k = 1)
+metrics = dictionary["pooled"]
+for k, v in metrics.items():
+        print(f"{k:8s}: {v:6.2f}")
+"""

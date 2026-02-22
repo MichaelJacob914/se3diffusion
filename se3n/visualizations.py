@@ -7,17 +7,17 @@ sys.path[:0] = [str(p) for p in paths if p.exists() and str(p) not in sys.path]
 from SO3n import so3_diffuser, SO3Algebra
 from R3n import r3_diffuser
 import se3n_models
-import datasets
-from datasets import RGBDepthDataset, RGBFeatureDataset
 from torch.utils.data import Subset, DataLoader
 from pathlib import Path
 import os
 import random
+import contextlib
 import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+from se3n_datasets import VisCo3DDataset, normalize_cameras, normalize_c2w_by_camera_centers        
 from scipy.spatial.transform import Rotation as Rot
 import math
 import random
@@ -31,9 +31,21 @@ from torch.utils.data import Dataset
 from torchvision import transforms
 from pathlib import Path
 from typing import List, Dict, Tuple, Literal
+from se3n_utils import rot_trans_from_se3, build_intrinsics
 import os
 import time
 from mpl_toolkits.mplot3d import Axes3D  
+from pi3.relpose.metric import (
+     se3_to_relative_pose_error_batched_c2w, se3_to_relative_pose_error,
+    calculate_auc, calculate_auc_np, rotation_angle, mat_to_quat, _sqrt_positive_part
+)
+
+import torch
+import numpy as np
+import matplotlib.pyplot as plt
+from pathlib import Path
+from scipy.spatial.transform import Rotation as Rot
+import random
 
 
 def axis_from_R(R: torch.Tensor):
@@ -45,609 +57,320 @@ def axis_from_R(R: torch.Tensor):
     print(angle)
     axis   = rotvec / (angle + 1e-8)
     return axis
-import torch
-import numpy as np
-import matplotlib.pyplot as plt
-from pathlib import Path
-from scipy.spatial.transform import Rotation as Rot
-import random
 
-@torch.no_grad()
-def visualize_pose_axes_full(
-    se3, dataloader, plot_name, conditioning, k=4, N=10, device="cuda",
-    rot_thresh_deg=15.0, trans_thresh=0.1, dir_thresh_deg=15.0
-):
-    import numpy as np
-    from pathlib import Path
-    import matplotlib.pyplot as plt
-    import torch
-    from scipy.spatial.transform import Rotation as Rot
 
-    se3.model.eval()
-
-    fig = plt.figure(figsize=(6, 6))
-    ax = fig.add_subplot(projection='3d')
-    ax.set_xlim([-1, 1]); ax.set_ylim([-1, 1]); ax.set_zlim([-1, 1])
-    ax.set_xlabel("x"); ax.set_ylabel("y"); ax.set_zlabel("z")
-    ax.set_box_aspect([1, 1, 1])
-    colors = plt.cm.tab10.colors
-
-    def rot_geodesic_deg(Ra, Rb):
-        R = Ra.transpose(-2, -1) @ Rb
-        tr = R[..., 0, 0] + R[..., 1, 1] + R[..., 2, 2]
-        cos_th = 0.5 * (tr - 1.0)
-        cos_th = torch.clamp(cos_th, -1.0 + 1e-7, 1.0 - 1e-7)
-        return torch.acos(cos_th) * (180.0 / np.pi)
-
-    def rel_from_two(R1, t1, R2, t2):
-        R_rel = R2 @ R1.transpose(-2, -1)
-        t_rel = t2 - (R2 @ R1.transpose(-2, -1) @ t1.unsqueeze(-1)).squeeze(-1)
-        return R_rel, t_rel
-
-    def dir_angle_deg(a, b, eps=1e-12):
-        # angle between directions in degrees
-        na = torch.linalg.norm(a)
-        nb = torch.linalg.norm(b)
-        if na < eps or nb < eps:
-            return float("inf")  # undefined direction → count as failure
-        cos = torch.clamp((a @ b) / (na * nb), -1.0, 1.0)
-        return float(torch.arccos(cos) * (180.0 / np.pi))
-
-    # ---- per-entry metrics (best draw) ----
-    per_entry = []
-    tot_cnt = rot_ok_cnt = trans_ok_cnt = joint_ok_cnt = 0
-
-    # ---- across-all-draws metrics ----
-    tot_draws = rot_ok_draws = trans_ok_draws = joint_ok_draws = dir_ok_draws = 0
-
-    drawn = 0
-    for batch in dataloader:
-        if drawn >= k:
-            break
-
-        take = min(k - drawn, batch["R"].shape[0])
-        for b in range(take):
-            j = drawn
-
-            # ---- GT (one sample) ----
-            if(conditioning == "features"):
-                R1 = batch["R1"][b].to(device)  # [3,3]
-                t1 = batch["t1"][b].to(device)  # [3]
-                R2 = batch["R2"][b].to(device)
-                t2 = batch["t2"][b].to(device)
-            elif(conditioning == "CO3D"):
-                R = batch["R"][b].to(device)
-                T = batch["t"][b].to(device)
-                R1, R2 = R[0].contiguous(), R[1].contiguous()   
-                t1, t2 = T[0].contiguous(), T[1].contiguous()
-                
-            R_rel_gt, t_rel_gt = rel_from_two(R1, t1, R2, t2)
-
-            # Plot GT axis + translation direction
-            rot_gt = Rot.from_matrix(R_rel_gt.detach().cpu().numpy()).as_rotvec()
-            theta_gt = np.linalg.norm(rot_gt)
-            axis_gt = rot_gt / (theta_gt + 1e-12) if theta_gt > 1e-8 else np.array([1.0, 0.0, 0.0])
-            ax.scatter(*axis_gt, color=colors[j % 10], marker='o', s=80, label=f"GT rot {j}")
-
-            tdir_gt_np = t_rel_gt.detach().cpu().numpy()
-            tdir_gt_np = tdir_gt_np / (np.linalg.norm(tdir_gt_np) + 1e-12) if np.linalg.norm(tdir_gt_np) > 1e-8 else np.array([1.0, 0.0, 0.0])
-            ax.scatter(*tdir_gt_np, color=colors[j % 10], marker='^', s=80, label=f"GT trans {j}")
-
-            # ---- conditioning for this sample ----
-            if conditioning == "depths":
-                depths = batch["depths"][b].to(device)
-                rgb    = batch["rgb"][b].to(device)
-                if rgb.ndim == 3:  # [C,H,W] where C=3*N
-                    C, H, W = rgb.shape
-                    assert C % 3 == 0
-                    Nviews = C // 3
-                    rgb = rgb.view(Nviews, 3, H, W).unsqueeze(0)  # [1,N,3,H,W]
-                elif rgb.ndim == 4:  # [N,3,H,W]
-                    rgb = rgb.unsqueeze(0)
-                else:
-                    raise ValueError(f"Unexpected rgb shape: {rgb.shape}")
-                if depths.ndim >= 3 and depths.shape[0] in (2,):
-                    depths = depths.unsqueeze(0)  # [1,N,...]
-                sample_args = {"depths": depths, "rgb": rgb}
-
-            elif conditioning == "features":
-                rgb   = batch["rgb"][b]
-                feats = batch["feats"][b]
-                sample_args = {"feats": feats.to(device), "rgb": rgb.to(device)}
-            elif conditioning == "CO3D":
-                import contextlib
-                p       = next(se3.model.parameters())
-                dev     = p.device
-                mdtype  = p.dtype
-
-                # first two views → device (keep fp32 for extractor)
-                imgs_pair = batch["imgs"][b][:2].to(dev, dtype=torch.float32, non_blocking=True).contiguous()
-
-                # DUSt3R on same device (AMP if CUDA), then cast feats/rgb to model dtype
-                amp = torch.autocast(device_type="cuda", dtype=torch.float16) if dev.type == "cuda" else contextlib.nullcontext()
-                with amp:
-                    feats_pair = se3.extractor(imgs_pair)
-
-                feats_pair = feats_pair.clone().to(dev, dtype=mdtype, non_blocking=True).contiguous()
-                rgb_pair   = imgs_pair.to(dev, dtype=mdtype, non_blocking=True).contiguous()
-
-                sample_args = {"feats": feats_pair, "rgb": rgb_pair}
-
-            else:
-                raise ValueError(f"Unsupported conditioning: {conditioning}")
-
-            # ---- search best over N draws & both permutations; also count per-draw metrics ----
-            best_ang_deg = float("inf")
-            best_trans_l2 = float("inf")
-            best_dir_deg = float("inf")
-
-            for n in range(N):
-                R_pair, t_pair = se3.sample(**sample_args, B=1, N=2, guidance=False, optim_steps=1, cost=None)
-                R0, R1p = R_pair[0], R_pair[1]
-                t0, t1p = t_pair[0], t_pair[1]
-
-                # two directions
-                R_rel_01, t_rel_01 = rel_from_two(R0,  t0,  R1p, t1p)
-                R_rel_10, t_rel_10 = rel_from_two(R1p, t1p, R0,  t0)
-
-                # errors
-                ang01 = rot_geodesic_deg(R_rel_01, R_rel_gt).item()
-                ang10 = rot_geodesic_deg(R_rel_10, R_rel_gt).item()
-                trans01 = torch.norm(t_rel_01 - t_rel_gt).item()
-                trans10 = torch.norm(t_rel_10 - t_rel_gt).item()
-
-                # translation direction angle (deg) for both permutations
-                dir01 = dir_angle_deg(t_rel_01, t_rel_gt)
-                dir10 = dir_angle_deg(t_rel_10, t_rel_gt)
-
-                # choose permutation for plotting and "best" selection (min ang+trans)
-                if (ang01 + trans01) <= (ang10 + trans10):
-                    ang_deg, trans_l2, dir_deg = ang01, trans01, dir01
-                    R_rel_pred, t_rel_pred = R_rel_01, t_rel_01
-                else:
-                    ang_deg, trans_l2, dir_deg = ang10, trans10, dir10
-                    R_rel_pred, t_rel_pred = R_rel_10, t_rel_10
-
-                # ---- per-draw counters (across all draws) ----
-                tot_draws += 1
-                r_ok = ang_deg < rot_thresh_deg
-                t_ok = trans_l2 < trans_thresh
-                d_ok = dir_deg < dir_thresh_deg
-                rot_ok_draws   += int(r_ok)
-                trans_ok_draws += int(t_ok)
-                joint_ok_draws += int(r_ok and t_ok)
-                dir_ok_draws   += int(d_ok)
-
-                # plot the chosen one for this draw
-                rot_pred = Rot.from_matrix(R_rel_pred.detach().cpu().numpy()).as_rotvec()
-                theta = np.linalg.norm(rot_pred)
-                axis_pred = rot_pred / (theta + 1e-12) if theta > 1e-8 else np.array([1.0, 0.0, 0.0])
-                ax.scatter(*axis_pred, color=colors[j % 10], marker='x', s=40)
-
-                tdir_pred_np = t_rel_pred.detach().cpu().numpy()
-                tdir_pred_np = tdir_pred_np / (np.linalg.norm(tdir_pred_np) + 1e-12) if np.linalg.norm(tdir_pred_np) > 1e-8 else np.array([1.0, 0.0, 0.0])
-                ax.scatter(*tdir_pred_np, color=colors[j % 10], marker='s', s=40)
-
-                # keep the best for per-entry report
-                if (ang_deg + trans_l2) < (best_ang_deg + best_trans_l2):
-                    best_ang_deg = ang_deg
-                    best_trans_l2 = trans_l2
-                    best_dir_deg = dir_deg
-
-                print(f"[k={j:02d} | draw {n:02d}]  Δθ_rel={ang_deg:6.2f}°  "
-                      f"‖Δt_rel‖={trans_l2:7.4f}  dirΔ={dir_deg:6.2f}°")
-
-            # ---- per-entry (best-draw) accuracy ----
-            rot_ok   = best_ang_deg   < rot_thresh_deg
-            trans_ok = best_trans_l2  < trans_thresh
-            dir_ok   = best_dir_deg   < dir_thresh_deg
-            joint_ok = rot_ok and trans_ok
-
-            per_entry.append({
-                "k": j,
-                "rot_deg": best_ang_deg,
-                "trans_l2": best_trans_l2,
-                "dir_deg": best_dir_deg,
-                "rot_ok": rot_ok,
-                "trans_ok": trans_ok,
-                "dir_ok_best": dir_ok,
-                "joint_ok": joint_ok,
-            })
-
-            tot_cnt += 1
-            rot_ok_cnt   += int(rot_ok)
-            trans_ok_cnt += int(trans_ok)
-            joint_ok_cnt += int(joint_ok)
-
-            drawn += 1
-            if drawn >= k:
-                break
-
-    # unit sphere
-    u, v = np.linspace(0, 2*np.pi, 100), np.linspace(0, np.pi, 100)
-    x, y = np.outer(np.cos(u), np.sin(v)), np.outer(np.sin(u), np.cos(v))
-    z = np.outer(np.ones_like(u), np.cos(v))
-    ax.plot_wireframe(x, y, z, color='gray', alpha=0.2)
-
-    ax.legend(loc="upper right", fontsize=8)
-    out_path = Path(plot_name)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(out_path, dpi=300, bbox_inches="tight")
-    plt.close(fig)
-    print(f"Saved RELATIVE rotation+translation axis plot to {out_path.resolve()}")
-
-    # ---- per-entry + overall summaries ----
-    print("\nPer-entry (best draw) accuracy @ "
-          f"rot<{rot_thresh_deg}°, trans<{trans_thresh}, dir<{dir_thresh_deg}°:")
-    for e in per_entry:
-        print(f"  k={e['k']:02d} | rot={e['rot_deg']:6.2f}° | trans={e['trans_l2']:7.4f} "
-              f"| dirΔ={e['dir_deg']:6.2f}° | rot_ok={int(e['rot_ok'])} "
-              f"trans_ok={int(e['trans_ok'])} dir_ok={int(e['dir_ok_best'])} "
-              f"joint_ok={int(e['joint_ok'])}")
-
-    if tot_cnt > 0:
-        rot_acc   = rot_ok_cnt   / tot_cnt
-        trans_acc = trans_ok_cnt / tot_cnt
-        joint_acc = joint_ok_cnt / tot_cnt
-        print(f"\nOverall (best-draw-per-entry) over {tot_cnt} entries:"
-              f"\n  rot_acc   (<{rot_thresh_deg}°): {rot_acc:.3f}"
-              f"\n  trans_acc (<{trans_thresh}):   {trans_acc:.3f}"
-              f"\n  joint_acc (both):              {joint_acc:.3f}")
-
-    if tot_draws > 0:
-        rot_acc_d   = rot_ok_draws   / tot_draws
-        trans_acc_d = trans_ok_draws / tot_draws
-        joint_acc_d = joint_ok_draws / tot_draws
-        dir_acc_d   = dir_ok_draws   / tot_draws
-        print(f"\nAcross ALL draws ({tot_draws} draws total):"
-              f"\n  rot_acc_draws   (<{rot_thresh_deg}°): {rot_acc_d:.3f}"
-              f"\n  trans_acc_draws (<{trans_thresh}):   {trans_acc_d:.3f}"
-              f"\n  dir_acc_draws   (<{dir_thresh_deg}°): {dir_acc_d:.3f}"
-              f"\n  joint_acc_draws (rot & trans):       {joint_acc_d:.3f}")
-              
-@torch.no_grad()
-def visualize_pose_predictions_with_inversion(se3, dataloader, plot_name, conditioning, k=4, N=10, device="cuda"):
+def se3_inverse(T: torch.Tensor) -> torch.Tensor:
     """
-    For k samples from the dataloader, visualize:
-    - Ground-truth relative pose
-    - Ground-truth inverse pose
-    - N model predictions from forward and inverse inputs
+    Invert SE(3) matrices.
+    T: [...,4,4]
     """
-    se3.model.eval()
-    fig = plt.figure(figsize=(6, 6))
-    ax = fig.add_subplot(projection='3d')
-    ax.set_xlim([-1, 1]); ax.set_ylim([-1, 1]); ax.set_zlim([-1, 1])
-    ax.set_xlabel("x"); ax.set_ylabel("y"); ax.set_zlabel("z")
-    ax.set_box_aspect([1, 1, 1])
-
-    color_cycle = plt.cm.tab20.colors  # 20 distinct colors
-    k = min(k, len(dataloader))
-    chosen_steps = random.sample(range(len(dataloader)), k)
-
-    for j, step_idx in enumerate(chosen_steps):
-        batch = dataloader.dataset[step_idx]
-
-        # Ground truth and relative poses
-        R_rel = batch["R"].to(device)
-        t_rel = batch["t"].to(device)
-        R1 = batch["R1"].to(device)
-        R2 = batch["R2"].to(device)
-        t1 = batch["t1"].to(device)
-        t2 = batch["t2"].to(device)
-
-        R_inv_gt = R_rel.T
-        t_inv_gt = -t_rel @ R_rel.T
-
-        # Assign unique colors for GT fwd and inv for this sample
-        color_fwd = color_cycle[(2 * j) % len(color_cycle)]
-        color_inv = color_cycle[(2 * j + 1) % len(color_cycle)]
-
-        # Plot GT poses
-        ax.scatter(*axis_from_R(R_rel), color=color_fwd, marker='o', s=80, label=f"GT Fwd {j}")
-        ax.scatter(*axis_from_R(R_inv_gt), color=color_inv, marker='o', s=80, label=f"GT Inv {j}")
-
-        # Sample inputs
-        feats = batch["feats"].unsqueeze(0).to(device)
-        rgb   = batch["rgb"].unsqueeze(0).to(device)
-
-        # Inverted inputs
-        feats_inv = batch["feats"].flip(0).unsqueeze(0).to(device)
-        rgb_inv   = torch.cat([batch["rgb"][3:], batch["rgb"][:3]], dim=0).unsqueeze(0).to(device)
-
-        for n in range(N):
-            R_fwd, t_fwd = se3.sample(feats=feats, rgb=rgb, N=1, guidance=False, optim_steps=1, cost=None)
-            R_inv, t_inv = se3.sample(feats=feats_inv, rgb=rgb_inv, N=1, guidance=False, optim_steps=1, cost=None)
-            R_fwd, t_fwd = R_fwd[0], t_fwd[0]
-            R_inv, t_inv = R_inv[0], t_inv[0]
-
-            # Plot predictions with same color as their GT
-            ax.scatter(*axis_from_R(R_fwd), color=color_fwd, marker='x', s=30)
-            ax.scatter(*axis_from_R(R_inv), color=color_inv, marker='x', s=30)
-
-            # Rotation equivariance check
-            R21_expected = R_fwd.T
-            t21_expected = -t_fwd @ R_fwd.T
-
-            R_err = torch.norm(R_inv - R21_expected)
-            t_err = torch.norm(t_inv - t21_expected)
-
-            print(f"[Sample {j:02d} | Iter {n:02d}]  ‖ΔR‖ = {R_err:.4f}   ‖Δt‖ = {t_err:.4f}")
-
-    # Draw unit sphere
-    u, v = np.linspace(0, 2 * np.pi, 100), np.linspace(0, np.pi, 100)
-    x = np.outer(np.cos(u), np.sin(v))
-    y = np.outer(np.sin(u), np.sin(v))
-    z = np.outer(np.ones_like(u), np.cos(v))
-    ax.plot_wireframe(x, y, z, color='gray', alpha=0.2)
-
-    ax.legend(loc="upper right", fontsize=8)
-    out_path = Path(plot_name)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(out_path, dpi=300, bbox_inches="tight")
-    plt.close(fig)
-    print(f"Saved plot to {out_path.resolve()}")
+    R = T[..., :3, :3]
+    t = T[..., :3, 3]
+    Rt = R.transpose(-2, -1)
+    t_inv = -(Rt @ t.unsqueeze(-1)).squeeze(-1)
+    out = torch.eye(4, device=T.device, dtype=T.dtype).expand(T.shape).clone()
+    out[..., :3, :3] = Rt
+    out[..., :3, 3] = t_inv
+    return out
     
+def compute_optimal_alignment(A, B):
+    """
+    Compute the optimal scale s, rotation R, and translation t that minimizes:
+    || A - (s * B @ R + T) || ^ 2
+
+    Reference: Umeyama (TPAMI 91)
+
+    Args:
+        A (torch.Tensor): (N, 3).
+        B (torch.Tensor): (N, 3).
+
+    Returns:
+        s (float): scale.
+        R (torch.Tensor): rotation matrix (3, 3).
+        t (torch.Tensor): translation (3,).
+    """
+    A_bar = A.mean(0)
+    B_bar = B.mean(0)
+    # normally with R @ B, this would be A @ B.T
+    H = (B - B_bar).T @ (A - A_bar)
+    U, S, Vh = torch.linalg.svd(H, full_matrices=True)
+    s = torch.linalg.det(U @ Vh)
+    S_prime = torch.diag(torch.tensor([1, 1, torch.sign(s)], device=A.device))
+    variance = torch.sum((B - B_bar) ** 2)
+    scale = 1 / variance * torch.trace(torch.diag(S) @ S_prime)
+    R = U @ S_prime @ Vh
+    t = A_bar - scale * B_bar @ R
+
+    A_hat = scale * B @ R + t
+    return A_hat, scale, R, t
+
+def rot_geodesic_deg(Ra, Rb):
+    R = Ra.transpose(-2, -1) @ Rb
+    tr = R[..., 0, 0] + R[..., 1, 1] + R[..., 2, 2]
+    cos_th = 0.5 * (tr - 1.0)
+    cos_th = torch.clamp(cos_th, -1.0 + 1e-7, 1.0 - 1e-7)
+    return torch.acos(cos_th) * (180.0 / np.pi)
+
+def rel_from_two_c2w(R1, t1, R2, t2):
+    Rt1 = R1.transpose(-2, -1)
+    R_rel = Rt1 @ R2
+    t_rel = (Rt1 @ (t2 - t1).unsqueeze(-1)).squeeze(-1)
+    return R_rel, t_rel
+
+def dir_angle_deg(a, b, eps=1e-12):
+    na = torch.linalg.norm(a)
+    nb = torch.linalg.norm(b)
+    if na < eps or nb < eps:
+        return float("inf")
+    cos = torch.clamp((a @ b) / (na * nb), -1.0, 1.0)
+    return float(torch.arccos(cos) * (180.0 / np.pi))
+
+def pack_se3_c2w(R: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+    """
+    Batch-safe pack of SE(3) camera-to-world matrices.
+
+    Args:
+        R: [..., 3, 3]
+        t: [..., 3]
+
+    Returns:
+        T: [..., 4, 4]
+    """
+    if R.shape[-2:] != (3, 3):
+        raise ValueError(f"R must end with (3,3), got {R.shape}")
+    if t.shape[-1] != 3:
+        raise ValueError(f"t must end with (3,), got {t.shape}")
+    if R.shape[:-2] != t.shape[:-1]:
+        raise ValueError(f"Leading dims must match: R {R.shape[:-2]} vs t {t.shape[:-1]}")
+
+    # Create identity with the right leading shape
+    T = torch.eye(4, device=R.device, dtype=R.dtype).expand(R.shape[:-2] + (4, 4)).clone()
+
+    T[..., :3, :3] = R
+    T[..., :3,  3] = t
+    return T
+
+def relative_pose_from_se3(T_i, T_j, closed_form_inverse_se3):
+    # matches their convention: T_rel = T_j * inv(T_i)
+    return closed_form_inverse_se3(T_i) @ T_j
+
+def closed_form_inverse_se3(se3, R=None, T=None):
+    """
+    Invert SE(3) transforms for arrays/tensors with shape [...,4,4] or [...,3,4].
+    Returns shape [...,4,4].
+    """
+    is_numpy = isinstance(se3, np.ndarray)
+
+    if se3.shape[-2:] not in [(4, 4), (3, 4)]:
+        raise ValueError(f"se3 must end with (4,4) or (3,4), got {se3.shape}.")
+
+    if R is None:
+        R = se3[..., :3, :3]     # [...,3,3]
+    if T is None:
+        T = se3[..., :3, 3:]     # [...,3,1]
+
+    if is_numpy:
+        R_T = np.swapaxes(R, -1, -2)           # [...,3,3]
+        top_right = -np.matmul(R_T, T)         # [...,3,1]
+        out_shape = se3.shape[:-2] + (4, 4)
+        inv = np.broadcast_to(np.eye(4, dtype=se3.dtype), out_shape).copy()
+        inv[..., :3, :3] = R_T
+        inv[..., :3, 3:] = top_right
+        return inv
+    else:
+        R_T = R.transpose(-1, -2)              # [...,3,3]
+        top_right = -torch.matmul(R_T, T)      # [...,3,1]
+        inv = torch.eye(4, device=se3.device, dtype=se3.dtype)
+        inv = inv.expand(se3.shape[:-2] + (4, 4)).clone()
+        inv[..., :3, :3] = R_T
+        inv[..., :3, 3:] = top_right
+        return inv
+
+def trans_l2_with_opt_scale(t_gt: torch.Tensor, t_pr: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
+    """
+    Per-pair optimal scale s minimizing || s t_pr - t_gt ||_2.
+    t_gt, t_pr: [..., 3]
+    Returns: [...], the minimized L2.
+    """
+    # s = (t_pr · t_gt) / (t_pr · t_pr)
+    denom = (t_pr * t_pr).sum(dim=-1, keepdim=True).clamp_min(eps)
+    s = (t_pr * t_gt).sum(dim=-1, keepdim=True) / denom
+    return (s * t_pr - t_gt).norm(dim=-1)
+
+def trans_l2_with_opt_scale_batched(t_gt, t_pr, eps=1e-12):
+    # t_gt, t_pr: [B,3]
+    num = (t_gt * t_pr).sum(dim=-1)                 # [B]
+    den = (t_pr * t_pr).sum(dim=-1).clamp(min=eps)  # [B]
+    s = num / den                                   # [B]
+    diff = t_gt - s[:, None] * t_pr                 # [B,3]
+    return diff.norm(dim=-1)          
+# TODO: this code can be further cleaned up
+
 @torch.no_grad()
-def visualize_cameras(se3, dataloader, plot_name, conditioning, k=4, N=10, device="cuda"):
-    from pytorch3d.renderer import PerspectiveCameras
-    from pytorch3d.vis.plotly_vis import plot_scene
-    import plotly.io as pio
-    from pathlib import Path
-    import numpy as np
-    import random, torch
+def trans_l2_allpairs_opt_scale_c2w(pred_se3, gt_se3, eps=1e-8):
+    """
+    pred_se3, gt_se3: [B,V,4,4] camera-to-world
+    Returns:
+      trans_l2_b: [B]  mean || s*t_pr - t_gt || over all i<j pairs
+      s: [B]      fitted global scale per item
+    """
+    device = pred_se3.device
+    B, V = pred_se3.shape[:2]
 
+    # indices for unique pairs
+    i, j = torch.combinations(torch.arange(V, device=device), r=2).unbind(-1)  # [P], [P]
+    P = i.numel()
+
+    # gather poses: [B,P,4,4]
+    gt_i = gt_se3[:, i]
+    gt_j = gt_se3[:, j]
+    pr_i = pred_se3[:, i]
+    pr_j = pred_se3[:, j]
+
+    # relative transforms: T_i^-1 T_j
+    gt_rel = torch.linalg.inv(gt_i) @ gt_j     # [B,P,4,4]
+    pr_rel = torch.linalg.inv(pr_i) @ pr_j     # [B,P,4,4]
+
+    t_gt = gt_rel[:, :, :3, 3]                # [B,P,3]
+    t_pr = pr_rel[:, :, :3, 3]                # [B,P,3]
+
+    w = torch.ones((B, P), device=device, dtype=t_pr.dtype)
+    num = (w.unsqueeze(-1) * (t_pr * t_gt)).sum(dim=(1, 2))              # [B]
+    den = (w.unsqueeze(-1) * (t_pr * t_pr)).sum(dim=(1, 2)) + eps        # [B]
+    s = num / den                                                        # [B]
+
+    diff = (s[:, None, None] * t_pr) - t_gt                               # [B,P,3]
+    trans_l2_b = diff.norm(dim=-1).mean(dim=1)                            # [B]
+
+    return trans_l2_b, s
+
+def rotation_angle(R_gt: torch.Tensor, R_pr: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
+    """
+    Geodesic rotation error between rotation matrices.
+
+    Args:
+        R_gt: [..., 3, 3]
+        R_pr: [..., 3, 3]
+
+    Returns:
+        angles: [...] in radians
+    """
+    # relative rotation
+    R_rel = R_gt.transpose(-1, -2) @ R_pr
+
+    # trace
+    tr = R_rel.diagonal(offset=0, dim1=-1, dim2=-2).sum(-1)
+
+    # numerical safety
+    cos_theta = (tr - 1.0) / 2.0
+    cos_theta = torch.clamp(cos_theta, -1.0 + eps, 1.0 - eps)
+
+    return torch.acos(cos_theta)
+
+@torch.no_grad
+def validation_statistics(
+    se3,
+    dataloader,
+    k=4,
+    N=1,
+    device="cuda",
+    thresholds=(5, 10, 15, 30),
+    guidance = False, 
+):
     se3.model.eval()
-    k = min(k, len(dataloader))
-    chosen_steps = random.sample(range(len(dataloader)), k)
 
-    for j, step_idx in enumerate(chosen_steps):
-        batch = dataloader.dataset[step_idx]
+    thresholds = tuple(thresholds)
 
-        # Load GT poses
-        R_gt = torch.stack([batch["R1"], batch["R2"]], dim=0).to(device)
-        t_gt = torch.stack([batch["t1"], batch["t2"]], dim=0).to(device)
+    # Accumulate pooled errors across ALL draws (Pi3-style global pool)
+    all_r = []
+    all_t = []
 
-        # Prepare model inputs
-        if conditioning == "depths":
-            sample_args = {
-                "depths": batch["depths"].unsqueeze(0).to(device),
-                "rgb": batch["rgb"].unsqueeze(0).to(device),
-            }
-        elif conditioning == "features":
-            rgb = batch["rgb"]
-            feats = batch["feats"]
-            if rgb.ndim == 4: rgb = rgb.unsqueeze(0)
-            if feats.ndim == 4: feats = feats.unsqueeze(0)
-            sample_args = {
-                "feats": feats.to(device),
-                "rgb": rgb.to(device)
-            }
-        else:
-            raise ValueError(f"Unsupported conditioning: {conditioning}")
+    # Also compute per-draw metrics so we can report mean/std across draws
+    per_draw_metrics = []  # list of dicts: {"RRA@5":..., "AUC@30":..., ...}
 
-        # Store predicted cameras
-        all_R_pred, all_t_pred = [], []
+    drawn_batches = 0
+    for step, batch in enumerate(dataloader):
+        if step >= 20:
+          break
+
+        imgs = batch["imgs"].to(device, non_blocking=True)  # [B,V,C,H,W]
+        Ks   = batch["K"].to(device, non_blocking=True)
+
+        R_gt = batch["R"].to(device, non_blocking=True)     # [B,V,3,3]
+        T_gt = batch["T"].to(device, non_blocking=True)     # [B,V,3]
+        gt_c2w = pack_se3_c2w(R_gt, T_gt)                   # [B,V,4,4]
+        gt_w2c = se3_inverse(gt_c2w)                        # [B,V,4,4]
+
+        num_views = batch.get("num_views", None)            # [B] or None
+        B, V = imgs.shape[:2]
+        objective = {"gt_poses": gt_c2w}
 
         for n in range(N):
-            R_pred, t_pred = se3.sample(**sample_args, stop=1, B=1, N=2, guidance=False, optim_steps=1, cost=None)
+            sample_out = se3.sample(imgs=imgs, Ks=Ks, guidance = False, optim_steps = 1000, objective = objective)
+            pred_c2w = pack_se3_c2w(sample_out["R"], sample_out["t"])  # [B,V,4,4]
+            pred_w2c = se3_inverse(pred_c2w)
 
-            # Find best permutation
-            perms = [(0, 1), (1, 0)]
-            best_perm, min_error = None, float('inf')
-            for perm in perms:
-                total_err = 0.0
-                for i in range(2):
-                    cos_theta = 0.5 * (torch.trace(R_gt[i].T @ R_pred[perm[i]]) - 1.0)
-                    cos_theta = torch.clamp(cos_theta, -1.0, 1.0)
-                    ang_err = torch.acos(cos_theta) * 180.0 / np.pi
-                    trans_err = torch.norm(t_gt[i] - t_pred[perm[i]])
-                    total_err += ang_err + trans_err
-                if total_err < min_error:
-                    min_error = total_err
-                    best_perm = perm
+            # Collect rr/tt for THIS draw (pool across items)
+            draw_r_list = []
+            draw_t_list = []
 
-            matched_R = torch.stack([R_pred[best_perm[0]], R_pred[best_perm[1]]], dim=0)
-            matched_t = torch.stack([t_pred[best_perm[0]], t_pred[best_perm[1]]], dim=0)
+            for b in range(B):
+                v = int(num_views[b]) if num_views is not None else V
+                dev = pred_w2c.device
+                pred = pred_w2c[b, :v].to(dev)
+                gt   = gt_w2c[b, :v].to(dev)
 
-            all_R_pred.append(matched_R)
-            all_t_pred.append(matched_t)
+                rel_rangle_deg, rel_tangle_deg = se3_to_relative_pose_error(
+                    pred_se3=pred,   # [v,4,4]
+                    gt_se3=gt,       # [v,4,4]
+                    num_frames=v,
+                )
+                draw_r_list.append(rel_rangle_deg.detach().cpu().numpy().reshape(-1))
+                draw_t_list.append(rel_tangle_deg.detach().cpu().numpy().reshape(-1))
 
-            # Print errors
-            for i in range(2):
-                ri = best_perm[i]
-                cos_theta = 0.5 * (torch.trace(R_gt[i].T @ R_pred[ri]) - 1.0)
-                cos_theta = torch.clamp(cos_theta, -1.0, 1.0)
-                ang_err = torch.acos(cos_theta).item() * 180.0 / np.pi
-                trans_err = torch.norm(t_gt[i] - t_pred[ri]).item()
-                print(f"[Sample {j:02d}, View {i}, Prediction {n:02d}] Δθ = {ang_err:6.2f}°, ‖Δt‖ = {trans_err:7.4f}")
+            draw_r = np.concatenate(draw_r_list, axis=0)
+            draw_t = np.concatenate(draw_t_list, axis=0)
 
-        # Stack predicted cameras
-        pred_R = torch.cat(all_R_pred, dim=0)
-        pred_t = torch.cat(all_t_pred, dim=0)
+            all_r.append(draw_r)
+            all_t.append(draw_t)
 
-        # Combine GT + Predicted into a single PerspectiveCameras object
-        all_R = torch.cat([R_gt, pred_R], dim=0)
-        all_T = torch.cat([t_gt, pred_t], dim=0)
-        all_cams = PerspectiveCameras(R=all_R, T=all_T, device=device)
+            # Compute per-draw metrics at thresholds
+            m = {}
+            for thr in thresholds:
+                m[f"RRA@{thr}"] = float((draw_r < thr).mean() * 100.0)
+                m[f"RTA@{thr}"] = float((draw_t < thr).mean() * 100.0)
+                auc, _ = calculate_auc_np(draw_r, draw_t, max_threshold=thr)
+                m[f"AUC@{thr}"] = float(auc * 100.0)
+            per_draw_metrics.append(m)
 
-        # Assign colors: red for GT, blue for predictions
-        red = torch.tensor([[1.0, 0.0, 0.0]], device=device)  # GT
-        blue = torch.tensor([[0.0, 0.0, 1.0]], device=device) # Pred
-        cam_colors = torch.cat([
-            red.repeat(R_gt.shape[0], 1),
-            blue.repeat(pred_R.shape[0], 1)
-        ], dim=0)
+        drawn_batches += 1
 
-        # One single frame: all cameras + color
-        scene = {
-            "scene": {
-                "cameras": all_cams,
-                "cameras_color": cam_colors
-            }
-        }
+    # ---- pooled metrics (like Pi3 eval, over all draws/items/pairs) ----
+    rError = np.concatenate(all_r, axis=0) if len(all_r) else np.array([])
+    tError = np.concatenate(all_t, axis=0) if len(all_t) else np.array([])
 
-        # Plot and save
-        fig = plot_scene(scene, layout=dict(width=800, height=800))
-        out_path = Path(plot_name) / f"scene_{j:02d}.html"
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        pio.write_html(fig, file=str(out_path), auto_open=False)
-        print(f"[Saved] Overlayed GT (red) + Predictions (blue) for sample {j} → {out_path.resolve()}")
+    metrics = {}
+    for thr in thresholds:
+        metrics[f"RRA@{thr}"] = float((rError < thr).mean() * 100.0)
+        metrics[f"RTA@{thr}"] = float((tError < thr).mean() * 100.0)
+        auc, _ = calculate_auc_np(rError, tError, max_threshold=thr)
+        metrics[f"AUC@{thr}"] = float(auc * 100.0)
 
-@torch.no_grad()
-def visualize_cameras_sfm(se3, dataloader, plot_name, conditioning, k=4, N=10, device="cuda"):
-    import trimesh
-    import numpy as np
-    import random, torch
-    from pathlib import Path
-    from scipy.spatial.transform import Rotation
-    import pyrender
+    # ---- draw mean/std (uncertainty across stochastic samples) ----
+    draw_stats = {}
+    if len(per_draw_metrics):
+        keys = list(per_draw_metrics[0].keys())
+        for kkey in keys:
+            vals = np.array([d[kkey] for d in per_draw_metrics], dtype=np.float64)
+            draw_stats[f"{kkey}_mean_over_draws"] = float(vals.mean())
+            draw_stats[f"{kkey}_std_over_draws"]  = float(vals.std(ddof=0))
 
-    def geotrf(matrix, pts):
-        pts_hom = np.concatenate([pts, np.ones((pts.shape[0], 1))], axis=-1)
-        return (matrix @ pts_hom.T).T[:, :3]
-
-    def add_scene_cam(scene, c2w, edge_color, image=None, focal=None, imsize=None, screen_width=0.03):
-        OPENGL = np.array([
-            [1, 0, 0, 0],
-            [0, -1, 0, 0],
-            [0, 0, -1, 0],
-            [0, 0, 0, 1]
-        ])
-
-        if image is not None:
-            H, W, THREE = image.shape
-        elif imsize is not None:
-            W, H = imsize
-        elif focal is not None:
-            H = W = focal / 1.1
-        else:
-            H = W = 1
-
-        if focal is None:
-            focal = min(H, W) * 1.1
-        elif isinstance(focal, np.ndarray):
-            focal = focal[0]
-
-        height = focal * screen_width / H
-        width = screen_width * np.sqrt(0.5)
-        rot45 = np.eye(4)
-        rot45[:3, :3] = Rotation.from_euler('z', np.deg2rad(45)).as_matrix()
-        rot45[2, 3] = -height
-        aspect_ratio = np.eye(4)
-        aspect_ratio[0, 0] = W / H
-        transform = c2w @ OPENGL @ aspect_ratio @ rot45
-        cam = trimesh.creation.cone(width, height, sections=4)
-
-        rot2 = np.eye(4)
-        rot2[:3, :3] = Rotation.from_euler('z', np.deg2rad(4)).as_matrix()
-        vertices = cam.vertices
-        vertices_offset = 0.9 * cam.vertices
-        vertices = np.r_[vertices, vertices_offset, geotrf(rot2, cam.vertices)]
-        vertices = geotrf(transform, vertices)
-        faces = []
-        for face in cam.faces:
-            if 0 in face: continue
-            a, b, c = face
-            a2, b2, c2 = face + len(cam.vertices)
-            faces += [
-                (a, b, b2), (a, a2, c), (c2, b, c),
-                (a, b2, a2), (a2, c, c2), (c2, b2, b)
-            ]
-        faces += [(c, b, a) for a, b, c in faces]
-        cam = trimesh.Trimesh(vertices=vertices, faces=faces)
-        cam.visual.face_colors[:, :3] = edge_color
-        scene.add_geometry(cam)
-
-    se3.model.eval()
-    k = min(k, len(dataloader))
-    chosen_steps = random.sample(range(len(dataloader)), k)
-
-    for j, step_idx in enumerate(chosen_steps):
-        batch = dataloader.dataset[step_idx]
-        R_gt = torch.stack([batch["R1"], batch["R2"]], dim=0).to(device)
-        t_gt = torch.stack([batch["t1"], batch["t2"]], dim=0).to(device)
-
-        # Get conditioning
-        if conditioning == "depths":
-            sample_args = {
-                "depths": batch["depths"].unsqueeze(0).to(device),
-                "rgb": batch["rgb"].unsqueeze(0).to(device),
-            }
-        elif conditioning == "features":
-            rgb = batch["rgb"]
-            feats = batch["feats"]
-            if rgb.ndim == 4: rgb = rgb.unsqueeze(0)
-            if feats.ndim == 4: feats = feats.unsqueeze(0)
-            sample_args = {
-                "feats": feats.to(device),
-                "rgb": rgb.to(device)
-            }
-        else:
-            raise ValueError(f"Unsupported conditioning: {conditioning}")
-
-        all_R_pred, all_t_pred = [], []
-        for n in range(N):
-            R_pred, t_pred = se3.sample(**sample_args, stop=1, B=1, N=2, guidance=False, optim_steps=1, cost=None)
-
-            # Match permutations
-            perms = [(0, 1), (1, 0)]
-            best_perm, min_error = None, float('inf')
-            for perm in perms:
-                total_err = 0.0
-                for i in range(2):
-                    cos_theta = 0.5 * (torch.trace(R_gt[i].T @ R_pred[perm[i]]) - 1.0)
-                    cos_theta = torch.clamp(cos_theta, -1.0, 1.0)
-                    ang_err = torch.acos(cos_theta) * 180.0 / np.pi
-                    trans_err = torch.norm(t_gt[i] - t_pred[perm[i]])
-                    total_err += ang_err + trans_err
-                    print(f"[Sample {j:02d}, View {i}, Prediction {n:02d}] Δθ = {ang_err:6.2f}°, ‖Δt‖ = {trans_err:7.4f}")
-                if total_err < min_error:
-                    min_error = total_err
-                    best_perm = perm
-
-            matched_R = torch.stack([R_pred[best_perm[0]], R_pred[best_perm[1]]], dim=0)
-            matched_t = torch.stack([t_pred[best_perm[0]], t_pred[best_perm[1]]], dim=0)
-            all_R_pred.append(matched_R)
-            all_t_pred.append(matched_t)
-
-        # Stack all predictions
-        pred_R = torch.cat(all_R_pred, dim=0)
-        pred_t = torch.cat(all_t_pred, dim=0)
-
-        # Create scene
-        scene = trimesh.Scene()
-
-        # Add GT cams in red
-        # Define 4 distinguishable colors (GT0, GT1, Pred0, Pred1)
-        color_map = {
-            "GT_0": [255, 0, 0],       # Red
-            "GT_1": [17, 191, 17],       # Green
-            "Pred_0": [26, 26, 237],     # Blue
-            "Pred_1": [242, 164, 19],   # Orange
-        }
-
-        # Add GT cameras with distinct colors
-        for i in range(2):
-            c2w = torch.eye(4)
-            c2w[:3, :3] = R_gt[i].cpu()
-            c2w[:3, 3] = t_gt[i].cpu()
-            cam_type = f"GT_{i}"
-            add_scene_cam(scene, c2w.numpy(), edge_color=color_map[cam_type])
-
-        # Add predicted cameras with matching index color (Pred_0 or Pred_1)
-        for i in range(pred_R.shape[0]):
-            c2w = torch.eye(4)
-            c2w[:3, :3] = pred_R[i].cpu()
-            c2w[:3, 3] = pred_t[i].cpu()
-            cam_type = f"Pred_{i % 2}"  # alternate 0,1,0,1...
-            add_scene_cam(scene, c2w.numpy(), edge_color=color_map[cam_type])
-
-
-        # Save output
-        out_path = Path(plot_name) / f"scene_{j:02d}.glb"
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        scene.export(out_path)
-        print(f"[Saved] GT (red) + Predictions (blue) camera scene to → {out_path.resolve()}")
+    return {
+        "pooled": metrics,
+        "draw_stats": draw_stats,
+        "num_draws": len(per_draw_metrics),
+        "num_pairs_total": int(rError.size),
+    }
 
 @torch.no_grad()
 def plot_so3_probabilities_full(
@@ -677,8 +400,9 @@ def plot_so3_probabilities_full(
 
     # --- helpers (same math as your other viz) ---
     def rel_from_two(R1, t1, R2, t2):
-        R_rel = R2 @ R1.transpose(-2, -1)
-        t_rel = t2 - (R2 @ R1.transpose(-2, -1) @ t1.unsqueeze(-1)).squeeze(-1)
+        """Pose of (R2,t2) expressed in frame of (R1,t1)."""
+        R_rel = R1.transpose(-2, -1) @ R2                    # R1^T R2
+        t_rel = (R1.transpose(-2, -1) @ (t2 - t1).unsqueeze(-1)).squeeze(-1)  # R1^T (t2 - t1)
         return R_rel, t_rel
 
     def rot_geodesic_deg(Ra, Rb):

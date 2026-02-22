@@ -149,7 +149,7 @@ class IGSO3Sampler:
 
 
 class SO3Algebra:
-    def __init__(self, device="cuda"):
+    def __init__(self, device="cpu"):
         self.device = torch.device(device)
         self.sampler = IGSO3Sampler()
 
@@ -323,6 +323,38 @@ class SO3Algebra:
         R[:, 2, 2] = 1 - 2 * (x**2 + y**2)
 
         return R
+    
+    def quaternion_to_matrix(quaternions):
+        """
+        Convert rotations given as quaternions to rotation matrices.
+
+        Args:
+            quaternions: quaternions with real part first,
+                as tensor of shape (..., 4).
+
+        Returns:
+            Rotation matrices as tensor of shape (..., 3, 3).
+        """
+        r, i, j, k = torch.unbind(quaternions, -1)
+        two_s = 2.0 / (quaternions * quaternions).sum(-1)
+
+        o = torch.stack(
+            (
+                1 - two_s * (j * j + k * k),
+                two_s * (i * j - k * r),
+                two_s * (i * k + j * r),
+                two_s * (i * j + k * r),
+                1 - two_s * (i * i + k * k),
+                two_s * (j * k - i * r),
+                two_s * (i * k - j * r),
+                two_s * (j * k + i * r),
+                1 - two_s * (i * i + j * j),
+            ),
+            -1,
+        )
+        return o.reshape(quaternions.shape[:-1] + (3, 3))
+
+
 
     def move_to_np(self, t: torch.Tensor):
         return t.detach().cpu().numpy()
@@ -370,12 +402,14 @@ class SO3Algebra:
 # In[21]:
 
 class so3_diffuser:
-    def __init__(self, prediction, T, batch_size=64, betas=None, device="cuda", cfg = None):
+    def __init__(self, prediction, T, representation = 'quat', forward_process = "ve", batch_size=64, betas=None, device="cpu", cfg = None):
         self.device = torch.device(device)
         self.T = T
+        self.representation = representation
         self.prediction = prediction
+        self.forward_process = forward_process
         self.alg = SO3Algebra(device=self.device)      
-        if(prediction == "score"): 
+        if(forward_process == "ve"): 
             self.schedule         = cfg.get("schedule", "logarithmic")
             self.min_sigma        = float(cfg.get("min_sigma", 0.1))
             self.max_sigma        = float(cfg.get("max_sigma",  1.5))
@@ -438,20 +472,6 @@ class so3_diffuser:
             den = self._pdf.sum(dim=-1).clamp_min(1e-12)                               # [S]
             self._score_scaling = torch.sqrt(torch.abs(num / den)) / math.sqrt(3.0)    # [S]
 
-            self.betas = self.make_betas_logsigma(self.T)
-            self.alphas, self.alpha_bars = self.compute_alpha_bars(self.betas)
-            self.beta_hats = self.compute_beta_hat(self.betas, self.alpha_bars)
-        else: 
-            if betas is None:
-                self.betas = self.make_cosine_beta_schedule(T).to(self.device)
-            else:
-                self.betas = torch.as_tensor(betas, dtype=torch.float32,
-                                            device=self.device)
-                
-            self.alphas, self.alpha_bars = self.compute_alpha_bars(self.betas)
-            self.beta_hats = self.compute_beta_hat(self.betas, self.alpha_bars)
-            
-
         self.batch_size = batch_size
 
     def make_betas_logsigma(
@@ -463,7 +483,6 @@ class so3_diffuser:
         """
         Discretize the SO(3) log-σ schedule into betas[1..T].
 
-        Schedule (your code):
             σ(t) = log( (1 - t) * e^{σ_min} + t * e^{σ_max} ),  t in [0,1].
         For VP-style corruption:
             m(t) = σ(t)^2 - σ_min^2   (so ᾱ(t) = exp(-m(t)) and m(0)=0).
@@ -600,269 +619,77 @@ class so3_diffuser:
 
     def sample_ref(self, n_samples: float=1):
         return self.sample(1, n_samples=n_samples)
-
-    def make_beta_schedule(self, T, beta_start=1e-4, beta_end=0.02):
-        return torch.linspace(beta_start, beta_end, T, dtype=torch.float32)
-
-    def make_cosine_beta_schedule(self, T, s=0.008):
-        steps = torch.arange(T + 1, dtype=torch.float32)
-        alphas_cumprod = torch.cos(((steps / T) + s) / (1 + s)
-                                   * math.pi * 0.5) ** 2
-        alphas_cumprod /= alphas_cumprod[0].clone()
-        betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
-        return betas.clamp(1e-8, 0.999)
-
-    def compute_alpha_bars(self, betas):
-        alphas = 1.0 - betas
-        alpha_bars = torch.cumprod(alphas, dim=0)
-        return alphas, alpha_bars
-
-    def compute_beta_hat(self, betas, alpha_bars):
-        beta_hats = torch.zeros_like(betas)
-        beta_hats[1:] = ((1 - alpha_bars[:-1]) / (1 - alpha_bars[1:])) \
-                        * betas[1:]
-        return beta_hats
     
-    def generate_noise(self, t, B, N, scale = 1.0): 
-        if(self.prediction == "score"): 
-            t_min, t_max = 1.0, self.T
-            t = (t - t_min) / (t_max - t_min)
-            return self.score_generate(t, B, N)
-        else: 
-            return self.noise_generate(t, B, N)
-    
-    def score_generate(
+    def generate_noise(self, t, B, N, scale=1.0):
+        if self.forward_process == "ve":
+            t = torch.as_tensor(t, device=self.device, dtype=torch.float32).clamp(0.01, 1.0)
+            return self.ve_noise_generate(t, B, N)
+
+    #variance exploding method
+    def ve_noise_generate(
         self,
         t,                 # torch.FloatTensor [B,N] in [0,1]
         B: int,
         N: int,
         scale: float = 1.0,
-        device: str | torch.device = "cuda",
+        device: str | torch.device = "cpu",
         dtype=torch.float32,
     ):
         t = torch.as_tensor(t, device=self.device, dtype=torch.float32)
         assert t.shape == (B, N), f"t must be [B,N]; got {tuple(t.shape)}"
 
-        # snap t -> sigma indices -> per-sample sigmas
         idx = self.t_to_idx(t)  # [B,N] long
         ds  = torch.as_tensor(self.discrete_sigma, device=self.device, dtype=torch.float32)
         sigmas = ds[idx].reshape(-1)  # [B*N]
 
-        # sample from your IGSO3 sampler (vectorized; no Python loops)
+        # sample from
         v_flat, R_flat = self.alg.sample_ig_so3(sigmas=sigmas)  # [B*N,3], [B*N,3,3] (torch)
 
         v = v_flat.view(B, N, 3).to(device=self.device, dtype=dtype)
         R = R_flat.view(B, N, 3, 3).to(device=self.device, dtype=dtype)
         return R, v
 
-    def noise_generate(self, ts=None, B=None, N=None, scale=1.0):
-        """
-        Generate SO(3)^N noise for B samples.
-
-        Args:
-            t:     scalar timestep (int)
-            ts:    per-sample timesteps (B, N)
-            B, N:  batch size and number of poses per batch
-            scale: optional scaling factor
-
-        Returns:
-            R_tensor: [B, N, 3, 3] — rotation matrices
-            v_tensor: [B, N, 3]    — axis-angle vectors used to generate them
-        """
-        if ts is not None:
-            ts_flat = ts.reshape(-1)  # shape: (B*N,)
-            sigma_flat = torch.sqrt(1 - self.alpha_bars[ts_flat])/torch.sqrt(torch.tensor([2])).to(self.device)  # shape: (B*N,)
-            v_tensor_flat, R_tensor_flat = self.alg.sample_ig_so3(sigmas=sigma_flat)  # batched sample
-        else:
-            assert t is not None, "Must provide either scalar `t` or tensor `ts`."
-            sigma_scalar = torch.sqrt(1 - self.alpha_bars[t])  # scalar
-            v_tensor_flat, R_tensor_flat = self.alg.sample_ig_so3(sigma=sigma_scalar, n_samples=B * N)
-
-        v_tensor = v_tensor_flat.reshape(B, N, 3)
-        R_tensor = R_tensor_flat.reshape(B, N, 3, 3)
-        return R_tensor, v_tensor
-
     def add_noise(self, x, R_noises, t): 
-        if(self.prediction == "score"): 
-            return self.score_forward(x, R_noises, t)
-        else: 
-            return self.noise_forward(x, R_noises, t)
+        if(self.forward_process == "ve"): 
+            return self.ve_forward(x, R_noises, t)
     
-    def score_forward(self, x, R_noises, t): 
+    #variance exploding
+    def ve_forward(self, x, R_noises, t): 
         x  = x.to(dtype=R_noises.dtype, device=R_noises.device)
         R_t = torch.einsum('...ij,...jk->...ik', x, R_noises)
         return R_t
-
-    def noise_forward(self, x, R_noises, t):
-        """
-        Applies multiplicative SO(3) noise to a batch of rotations x using noise R_noises.
-
-        Args:
-            x         : [B, N, 3, 3] — clean rotations
-            R_noises  : [B, N, 3, 3] — sampled noise rotations
-            t         : [B, N] or scalar timestep(s)
-
-        Returns:
-            x_noisy   : [B, N, 3, 3] — noisy rotations
-        """
-        B, N = x.shape[:2]
-        x_flat = x.reshape(-1, 3, 3)                 # [B*N, 3, 3]
-        R_flat = R_noises.reshape(-1, 3, 3)          # [B*N, 3, 3]
-
-        # Log map of clean rotations
-        S = self.alg.log_map(x_flat)             # [B*N, 3, 3]
-        v = self.alg.get_v(S)                    # [B*N, 3]
-
-        # Handle scalar or per-pose `t`
-        if isinstance(t, (int, float)):
-            alpha = self.alpha_bars[int(t)]
-            scale = torch.sqrt(alpha)
-            v_scaled = v * scale                  # [B*N, 3]
-        else:
-            t_flat = t.reshape(-1).long()                                 # [B*N]
-            alpha = self.alpha_bars[t_flat]                            # [B*N]
-            scale = torch.sqrt(alpha)                                  # [B*N]
-            v_scaled = v * scale[:, None]                              # [B*N, 3]
-
-        # Re-exponentiate the scaled rotations
-        x_scaled = self.alg.exp_map(v_scaled)      # [B*N, 3, 3]
-
-        # Apply left-multiplicative noise
-        x_noisy_flat = torch.bmm(R_flat, x_scaled) # [B*N, 3, 3]
-        x_noisy_flat = torch.bmm(x_noisy_flat, R_flat)
-        return x_noisy_flat.reshape(B, N, 3, 3)
-
-    def _se_sample_noise(self, x_t, t, noise, equivariance = False, guidance=False, optim_steps=1, cost=None):
-        """
-        Perform one SE(3) sampling step for N rotation matrices.
-
-        Args:
-            x_t     : [N, 3, 3] — current noisy rotations
-            t       : int       — timestep
-            noise   : [N, 3]    — predicted axis-angle noise
-            guidance: bool      — whether to apply descent
-            optim_steps: int    — descent frequency
-            cost    : any       — optional guidance cost
-
-        Returns:
-            x0      : [N, 3, 3] — predicted clean rotations
-            xtm1    : [N, 3, 3] — sampled R_{t-1}
-        """
-        N, device = x_t.shape[1], x_t.device
-
-        # Rₜ noise
-        if t > 1:
-            beta_hat = self.beta_hats[t]
-            _, R_noise = self.alg.sample_ig_so3(beta_hat, n_samples=N)  # [N, 3, 3]
-        else:
-            R_noise = torch.eye(3, device=device).expand(N, 3, 3)        # [N, 3, 3]
-
-        # Reconstruct x₀ = exp(ω / sqrt(ᾱₜ)) · exp(√(1−ᾱₜ) · v)
-        v_scaled = noise * torch.sqrt(1 - self.alpha_bars[t])    # [N, 3]
-        x_t = x_t.squeeze(0)
-        v_scaled = v_scaled.squeeze(0)
-        omega = self.alg.get_v(self.alg.log_map(x_t))                   # [N, 3]
-        if(equivariance): 
-            a1 = self.alg.exp_map(omega / torch.sqrt(self.alpha_bars[t]))  # [N, 3, 3]
-            a2 = self.alg.exp_map(v_scaled/2)                                 # [N, 3, 3]
-            x0 = torch.bmm(a1, a2.transpose(1, 2))  # [B*N, 3, 3]
-            x0 = torch.bmm(a2.transpose(1,2), x0)
-            xtm1 = self.alg.tilde_nu(x_t, x0, t,
-                                self.alphas, self.alpha_bars, self.betas, equivariance = True)  # [N, 3, 3]
-        else: 
-            a1 = self.alg.exp_map(omega / torch.sqrt(self.alpha_bars[t]))  # [N, 3, 3]
-            a2 = self.alg.exp_map(v_scaled)                                 # [N, 3, 3]
-            x0 = torch.bmm(a1, a2.transpose(1, 2))  # [B*N, 3, 3]
-            xtm1 = self.alg.tilde_nu(x_t, x0, t,
-                                self.alphas, self.alpha_bars, self.betas)  # [N, 3, 3]
-
-        xtm1 = torch.bmm(xtm1, R_noise)                                    # [N, 3, 3]
-        
-        # Optional guidance
-        if guidance and t % optim_steps == 0:
-            xtm1 = self.descent(xtm1, x0, t, cost).detach()                # [N, 3, 3]
-
-        return xtm1.unsqueeze(0), x0.unsqueeze(0)
     
-    def _se_sample_pose(self, x_t, t, x_0, guidance=False, optim_steps=1, cost=None):
-        """
-        Perform one SE(3) sampling step for N rotation matrices.
-
-        Args:
-            x_t     : [N, 3, 3] — current noisy rotations
-            t       : int       — timestep
-            noise   : [N, 3]    — predicted axis-angle noise
-            guidance: bool      — whether to apply descent
-            optim_steps: int    — descent frequency
-            cost    : any       — optional guidance cost
-
-        Returns:
-            x0      : [N, 3, 3] — predicted clean rotations
-            xtm1    : [N, 3, 3] — sampled R_{t-1}
-        """
-        B, N, device = x_t.shape[0], x_t.shape[1], x_t.device
-
-        # Rₜ noise
-        if t > 1:
-            beta_hat = self.beta_hats[t]
-            _, R_noise = self.alg.sample_ig_so3(beta_hat, n_samples=N)  # [N, 3, 3]
-        else:
-            R_noise = torch.eye(3, device=device).expand(N, 3, 3)        # [N, 3, 3]
-
-        # Reconstruct x₀ = exp(ω / sqrt(ᾱₜ)) · exp(√(1−ᾱₜ) · v)
-        x_0 = x_0.reshape(B*N, -1)
-        x_0 = self.alg.quaternion_to_rotmat(self.alg.make_unit_quaternion(x_0))
-        x_t = x_t.squeeze(0)
-        x_0 = x_0.reshape(N,3,3)
-
-        xtm1 = self.alg.tilde_nu(x_t, x_0, t,
-                                self.alphas, self.alpha_bars, self.betas)  # [N, 3, 3]
-        xtm1 = torch.bmm(xtm1, R_noise)                                    # [N, 3, 3]
-        
-        # Optional guidance
-        if guidance and t % optim_steps == 0:
-            xtm1 = self.descent(xtm1, x_0, t, cost).detach()                # [N, 3, 3]
-
-        return xtm1.unsqueeze(0), x_0.unsqueeze(0)
-    
+    #variance exploding schema
     @torch.no_grad()
-    def _se_sample_score(self, x_t, t, x_0, noise_scale=0.0):
+    def _se_sample_ve(self, x_t, t, x_0, noise_scale=0.0, threshold = 0):
         """
-        One reverse step on SO(3)^N using pose-only model (torch path).
+            One reverse step on SO(3)^N using score model, batched over B.
+            Expects x_t, x_0: [B, N, 3, 3]
         """
         device, dtype = x_t.device, x_t.dtype
-        T = float(self.T)
-        t_cont = torch.tensor(float(t) / T, device=device, dtype=torch.float32)  # [1]
-        dt_cont = 1.0 / T
+        B, N = x_t.shape[0], x_t.shape[1]
 
-        rot_t_vec = self.alg.get_v(self.alg.log_map(x_t))                         # [N,3]
-        s_pred    = self.compute_score(x_t.squeeze(0), x_0.squeeze(0), float(t_cont))  # [N,3]
+        t_cont = torch.as_tensor(t, device=device, dtype=torch.float32)
+        dt_cont = 1.0 / float(self.T)
 
-        rot_tm1   = self.reverse(
+        # rot_t_vec should match x_t batch shape: [B, N, 3]
+        rot_t_vec = self.alg.get_v(self.alg.log_map(x_t))   # [B, N, 3]
+
+        # score should match: [B, N, 3]
+        s_pred = self.compute_score(x_t, x_0, t_cont)       # [B, N, 3]
+
+        # reverse should return [B, N, 3]
+        rot_tm1 = self.reverse(
             rot_t=rot_t_vec,
             score_t=s_pred,
-            t=t_cont,                                  # torch scalar
+            t=t_cont,            
             dt=dt_cont,
             mask=None,
             noise_scale=noise_scale,
-        )                                              # [N,3] (torch)
+        )                           # [B, N, 3]
 
-        xtm1 = self.alg.exp_map(rot_tm1).to(device=device, dtype=dtype)          # [N,3,3]
+        xtm1 = self.alg.exp_map(rot_tm1).to(device=device, dtype=dtype)  # [B, N, 3, 3]
         return xtm1, x_0
-    
-    def descent(self, x_t, x_0, t, cost, num_updates = 1, lr = 1e-3): 
-        x_0_optim = geoopt.ManifoldParameter(x_0, manifold=Stiefel)
-        x_t_optim = geoopt.ManifoldParameter(x_t, manifold=Stiefel)
-        for i in range(num_updates): 
-            loss = cost(x_t_optim, x_0_optim, t)
-            loss.backward()
-            rgrad_x_t = Stiefel.egrad2rgrad(x_t_optim, x_t_optim.grad)
-    
-            with(torch.no_grad()): 
-                x_t_optim.set_(Stiefel.retr(x_t_optim, -lr * rgrad_x_t))
-    
-            x_t_optim.grad.zero_()
-        return x_t_optim
 
     def compose_rotvec(self, a, b):
         Ra = self.alg.exp_map(torch.as_tensor(a))
@@ -877,17 +704,17 @@ class so3_diffuser:
         R0: [...,3,3] or [...,3] (rotvecs)
         t : scalar or tensor broadcastable to Rt batch (e.g. [B*N] or [B,N])
         """
-        # Ensure R0 is a matrix
-        R0m = R0 if (R0.dim() >= 2 and R0.shape[-2:] == (3, 3)) else self.alg.exp_map(R0)
-        if R0m.dim() == 2:  # [3,3] -> broadcast to batch
-            R0m = R0m.expand(Rt.shape[0], -1, -1)
+        Rrel = R0.transpose(-1, -2) @ Rt                 # [B, N, 3, 3]
+        r_rel = self.alg.get_v(self.alg.log_map(Rrel))   # [B, N, 3]
 
-        Rrel  = R0m.transpose(-1, -2) @ Rt                 # [...,3,3]
-        r_rel = self.alg.get_v(self.alg.log_map(Rrel))     # [...,3]
+        # Make t a torch tensor on the right device; allow scalar / [B] / [B,N]
+        t_tensor = torch.as_tensor(t, device=Rt.device, dtype=torch.float32)
 
-        t_tensor = t.to(device=r_rel.device, dtype=torch.float32) if torch.is_tensor(t) \
-                else torch.tensor(t, device=r_rel.device, dtype=torch.float32)
-        return self.torch_score(r_rel, t_tensor)           # [...,3]
+        # torch_score expects t broadcastable to omega shape ([B,N])
+        if t_tensor.ndim == 1:
+            t_tensor = t_tensor[:, None]                # [B,1]
+
+        return self.torch_score(r_rel, t_tensor)         # [B, N, 3]
         
     def score(
             self,
@@ -931,7 +758,7 @@ class so3_diffuser:
         if self.use_cached_score:
             # time -> row indices in precomputed tables
             ds = torch.as_tensor(self.discrete_sigma, device=device, dtype=torch.float32)   # [S]
-            idx = torch.bucketize(sigma_t, ds, right=True) - 1
+            idx = torch.bucketize(sigma_t, ds, right=False) - 1
             idx = idx.clamp(0, ds.numel() - 1)                   # shape like t
 
             # ω -> column bins
@@ -957,6 +784,8 @@ class so3_diffuser:
             omega_scores = self.alg.score(
                 omega_vals, omega_flat, sigma_exp, use_torch=True
             )
+            omega_scores = omega_scores.view_as(omega)
+        
         return omega_scores[..., None] * vec / (omega[..., None])
 
     def score_scaling(self, t: np.ndarray):
@@ -993,12 +822,13 @@ class so3_diffuser:
             ):
         """Simulates the reverse SDE for 1 step using a right-multiplicative update (torch)."""
         # ensure torch tensors on the right device/dtype
-        rot_t   = torch.as_tensor(rot_t,   device=self.device, dtype=torch.float32)
-        score_t = torch.as_tensor(score_t, device=self.device, dtype=torch.float32)
-        mask_t  = None if mask is None else torch.as_tensor(mask, device=self.device, dtype=torch.float32)
+        device = rot_t.device if torch.is_tensor(rot_t) else (score_t.device if torch.is_tensor(score_t) else self.device)
+        rot_t   = torch.as_tensor(rot_t,   device=device, dtype=torch.float32)
+        score_t = torch.as_tensor(score_t, device=device, dtype=torch.float32)
+        mask_t  = None if mask is None else torch.as_tensor(mask, device=device, dtype=torch.float32)
 
         # g(t) from the torch-only diffusion_coef (supports broadcasting)
-        t_torch = torch.as_tensor(t, device=self.device, dtype=torch.float32)
+        t_torch = torch.as_tensor(t, device=device, dtype=torch.float32)
         g = self.diffusion_coef(t_torch)                         # scalar or broadcastable tensor
 
         # perturbation
@@ -1018,8 +848,8 @@ class so3_diffuser:
         rot_t_1 = self.alg.get_v(self.alg.log_map(Rab))          # [...,3]
         return rot_t_1
 
-# In[ ]:
-
-
+    def score_scaling(self, t: np.ndarray):
+        """Calculates scaling used for scores during trianing."""
+        return self._score_scaling[self.t_to_idx(t)]
 
 
